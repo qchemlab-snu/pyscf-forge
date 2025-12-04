@@ -364,12 +364,9 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         for i in as_list:
             new_mo_coeff=numpy.insert(new_mo_coeff,i,highspin_mo_coeff[:,i],axis=1)
         mo_coeff=new_mo_coeff
-
-
-        AS_fock_energy=lib.einsum('ai,aj,ij->a',numpy.conjugate(mo_coeff.T),mo_coeff.T,fock)
-        for i in as_list:
-            new_mo_energy=numpy.insert(new_mo_energy,i,AS_fock_energy[i])
-        mo_energy=new_mo_energy
+        new_mo_basis_fock = mo_coeff.T @ fock @ mo_coeff
+    
+        mo_energy=numpy.diag(new_mo_basis_fock)
         dm = mf.make_rdm1(mo_coeff,mo_occ)
         vhf = mf.get_veff(mol, dm, dm_last, vhf)
         e_tot = mf.energy_tot(dm, h1e, vhf)
@@ -417,18 +414,15 @@ Keyword argument "init_dm" is replaced by "dm0"''')
 
         for i in as_list:
             new_mo_coeff=numpy.insert(new_mo_coeff,i,mo_coeff[:,i],axis=1)
-
-        mo_coeff=new_mo_coeff
-
-        AS_fock_energy=lib.einsum('ai,aj,ij->a',numpy.conjugate(mo_coeff.T),mo_coeff.T,fock)
-        for i in as_list:
-            new_mo_energy=numpy.insert(new_mo_energy,i,AS_fock_energy[i])
-        mo_energy=new_mo_energy
+        mo_coeff = new_mo_coeff
+        new_mo_basis_fock = mo_coeff.T @ fock @ mo_coeff
+        mo_energy=numpy.diag(new_mo_basis_fock)
         dm, dm_last = mf.make_rdm1(mo_coeff, mo_occ), dm
         vhf = mf.get_veff(mol, dm,dm_last,vhf)
         e_tot, last_hf_e = mf.energy_tot(dm, h1e, vhf), e_tot
 
         fock = mf.get_fock(h1e, s1e, vhf, dm)
+        
         norm_gorb = numpy.linalg.norm(mf.get_grad(mo_coeff, mo_occ, fock))
         if not TIGHT_GRAD_CONV_TOL:
             norm_gorb = norm_gorb / numpy.sqrt(norm_gorb.size)
@@ -613,6 +607,7 @@ def optimize_mo(sfnoci, mo_coeff = None, ncas = None, nelecas = None, ncore = No
     group = None
     if not hasattr(sfnoci, '_groupA'):
         optimized_mo=numpy.zeros((p,N,N))
+        moe_list = numpy.zeros((p,N))
         #SF-CAS
         if debug:
             for i, occ in enumerate(po_list):
@@ -625,6 +620,7 @@ def optimize_mo(sfnoci, mo_coeff = None, ncas = None, nelecas = None, ncore = No
                                                            max_cycle= sfnoci._scf.max_cycle)
                 print(conv, et)
                 optimized_mo[i]=moce
+                moe_list[i] = moe
                 print("occuped pattern index:")
                 print(i)
 
@@ -637,6 +633,7 @@ def optimize_mo(sfnoci, mo_coeff = None, ncas = None, nelecas = None, ncore = No
         else: NotImplementedError
         g = len(group)
         optimized_mo = numpy.zeros((g,N,N))
+        moe_list = numpy.zeros((g,N))
         for i in range(0,g):
             #SF-CAS
             if debug:
@@ -649,6 +646,7 @@ def optimize_mo(sfnoci, mo_coeff = None, ncas = None, nelecas = None, ncore = No
                                                           max_cycle= sfnoci._scf.max_cycle)
                 print(conv, et)
                 optimized_mo[i]=moce
+                moe_list[i] = moe
                 print("occuped pattern index:")
                 print(i)
 
@@ -681,11 +679,13 @@ def h1e_for_sfnoci(sfnoci, dmet_act_list=None, mo_list=None, dmet_core_list=None
     ecore_list = numpy.zeros(p)
     energy_nuc = sfnoci.energy_nuc()
     ha1e = lib.einsum('ai,ab,bj->ij',mo_cas,hcore,mo_cas)
-
+    
     for i in range(0,p):
         for j in range(0,p):
-            corevhf = sfnoci.get_veff(dm = 2 * dmet_core_list[i,j])
-            h1e[i,j] = ha1e + lib.einsum('ijab,ab -> ij', dmet_act_list , corevhf)
+            if  i>=j :
+                corevhf = sfnoci.get_veff(dm = 2 * dmet_core_list[i,j], hermi = 0)
+                h1e[i,j] = ha1e + lib.einsum('ijab,ab -> ij', dmet_act_list , corevhf)
+                h1e[j,i] = h1e[i,j].T
             if i==j:
                 ecore_list[i] += lib.einsum('ab,ab -> ', dmet_core_list[i,i],corevhf)
                 ecore_list[i] += energy_nuc
@@ -856,9 +856,10 @@ class SFNOCI(CASBase):
             for j in range(0,p):
                 wc_mo_coeff = mo_list[j][:,core_list]
                 S, xc_bimo_coeff, wc_bimo_coeff, U, Vt = biorthogonalize(xc_mo_coeff, wc_mo_coeff, s1e)
-                ov_list[i,j] = numpy.prod(S[numpy.abs(S)>1e-10])*numpy.linalg.det(U)*numpy.linalg.det(Vt)
-                for c in range(0,ncore):
-                    dmet_core_list[i,j] +=numpy.outer(xc_bimo_coeff[:,c],wc_bimo_coeff[:,c])/S[c]
+                ov_list[i,j] = (numpy.prod(S[numpy.abs(S)>1e-10]))**2
+                dmet_core_list[i,j] += xc_bimo_coeff @ numpy.diag(1/S) @ wc_bimo_coeff.T
+                # for c in range(0,ncore):
+                #     dmet_core_list[i,j] +=numpy.outer(xc_bimo_coeff[:,c],wc_bimo_coeff[:,c])/S[c]
         return dmet_core_list, ov_list
 
     def get_active_dm(self,mo_coeff = None):

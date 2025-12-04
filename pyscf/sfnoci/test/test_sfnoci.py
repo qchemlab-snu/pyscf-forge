@@ -63,7 +63,7 @@ class KnownValues(unittest.TestCase):
         mo = addons.sort_mo(mySFNOCI,mo, as_list,1)
         re, _, ci = mySFNOCI.kernel(mo)
 
-        self.assertAlmostEqual(e-re, -0.11279175858597057, 6)
+        self.assertAlmostEqual(e-re, -0.11199275370120176, 6)
 
     def test_sfgnoci(self):
         mol = gto.Mole()
@@ -101,7 +101,7 @@ class KnownValues(unittest.TestCase):
         mo = addons.sort_mo(mySFNOCI,mo, as_list,1)
         re, _, ci = mySFNOCI.kernel(mo)
 
-        self.assertAlmostEqual(e-re, -0.1129230696617185, 6)
+        self.assertAlmostEqual(e-re, -0.11212246790661595, 6)
 
 
 
