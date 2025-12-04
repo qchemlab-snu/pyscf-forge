@@ -526,10 +526,9 @@ def StateAverage_FASSCF(sfnoci, target_group, po_list, group, mo_coeff = None,
         mo_coeff=new_mo_coeff
 
 
-        as_fock_energy=lib.einsum('ai,aj,ij->a',numpy.conjugate(mo_coeff.T),mo_coeff.T,fock)
-        for i in as_list:
-            new_mo_energy=numpy.insert(new_mo_energy,i,as_fock_energy[i])
-        mo_energy = new_mo_energy
+        new_mo_basis_fock = mo_coeff.T @ fock @ mo_coeff
+    
+        mo_energy=numpy.diag(new_mo_basis_fock)
 
         core_mo_coeff = mo_coeff[:,:ncore]
         dm_core = (core_mo_coeff).dot(core_mo_coeff.conj().T)
@@ -569,10 +568,9 @@ def StateAverage_FASSCF(sfnoci, target_group, po_list, group, mo_coeff = None,
 
         mo_coeff=new_mo_coeff
 
-        AS_fock_energy=lib.einsum('ai,aj,ij->a',numpy.conjugate(mo_coeff.T),mo_coeff.T,fock)
-        for i in as_list:
-            new_mo_energy=numpy.insert(new_mo_energy,i,AS_fock_energy[i])
-        mo_energy=new_mo_energy
+        new_mo_basis_fock = mo_coeff.T @ fock @ mo_coeff
+    
+        mo_energy=numpy.diag(new_mo_basis_fock)
         dm_last = dm
         core_mo_coeff = mo_coeff[:,:ncore]
         dm_core = (core_mo_coeff * 2).dot(core_mo_coeff.conj().T)
