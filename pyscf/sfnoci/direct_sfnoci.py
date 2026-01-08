@@ -520,6 +520,97 @@ def make_rdm2(mo_coeff, ci, ncas, nelecas, ncore, dmet_core_list, conf_info_list
         make_rdm2s(mo_coeff, ci, ncas, nelecas, ncore,dmet_core_list, conf_info_list, ov_list)
     return rdm2aa + rdm2ab + rdm2ba + rdm2bb
 
+def make_trans_rdm1(dspin, cibra, ciket, norb, nelec_bra,nelec_ket, conf_info_list_bra, conf_info_list_ket, ov_list):
+    """
+    One-particle transition density matrix between states
+    with different spins.
+
+    Args:
+        dspin : str 'aa' or 'bb' or 'ab' or 'ba'
+            the spin subscript of p, q operators
+        cibra : np.ndarray((n_det_alpha, n_det_beta))
+            ci vector for bra wavefunction
+        ciket : np.ndarray((n_det_alpha, n_det_beta))
+            ci vector for ket wavefunction
+        norb : int
+            number of orbitals
+            in this case, number of active orbitals
+        nelec_bra : (int, int)
+            numebr of alpha and beta electrons in bra state
+        nelec_ket : (int, int)
+            numebr of alpha and beta electrons in ket state
+        conf_info_list_bra : np.ndarray((n_det_alpha, n_det_beta))
+            optimized bath orbitals indices for each configuration in bra state
+        conf_info_list_ket : np.ndarray((n_det_alpha, n_det_beta)) 
+            optimized bath orbitals indices for each configuration in ket state
+        ov_list : (ngroup, ngroup)
+            overlap matrix between bath orbitals
+    Returns:
+        rdm1 : np.ndarray((norb, norb))
+            transition density matrix
+    """
+    nelabra, nelbbra = nelec_bra
+    nelaket, nelbket = nelec_ket
+    if dspin == 'ba':
+        cond = nelabra == nelaket - 1 and nelbbra == nelbket + 1
+    elif dspin == 'ab':
+        cond = nelabra == nelaket + 1 and nelbbra == nelbket - 1
+    elif dspin == 'aa':
+        cond = nelabra == nelaket and nelbbra == nelbket and nelabra > 0
+    else:
+        cond = nelabra == nelaket and nelbbra == nelbket and nelbbra > 0
+    if not cond:
+        return numpy.array(0)
+    nabra = fci.cistring.num_strings(norb, nelabra)
+    nbbra = fci.cistring.num_strings(norb, nelbbra)
+    naket = fci.cistring.num_strings(norb, nelaket)
+    nbket = fci.cistring.num_strings(norb, nelbket)
+
+    cibra = cibra.reshape(nabra, nbbra)
+    ciket = ciket.reshape(naket, nbket)
+    rdm1 = numpy.zeros((norb,norb))
+    if cond:
+        if dspin == 'ba':
+            lidxa = fci.cistring.gen_des_str_index(range(norb),nelaket)
+            lidxb = fci.cistring.gen_cre_str_index(range(norb),nelbket)
+            for str0a in range(naket):
+                for str0b in range(nbket):
+                    for a, _, str1b, signb in lidxb[str0b]:
+                        for _ , i, str1a, signa in lidxa[str0a]:
+                            p1 = conf_info_list_bra[str1a, str1b]
+                            p2 = conf_info_list_ket[str0a, str0b]
+                            rdm1[a,i] += numpy.conjugate(cibra[str1a,str1b])*ciket[str0a,str0b]*ov_list[p1,p2]*signa *signb
+
+        elif dspin == 'ab':
+            lidxa = fci.cistring.gen_cre_str_index(range(norb),nelaket)
+            lidxb = fci.cistring.gen_des_str_index(range(norb),nelbket)
+            for str0a in range(naket):
+                for str0b in range(nbket):
+                    for a, _, str1a, signa in lidxa[str0a]:
+                        for _, i, str1b, signb in lidxb[str0b]:
+                            p1 = conf_info_list_bra[str1a, str1b]
+                            p2 = conf_info_list_ket[str0a, str0b]
+                            rdm1[a,i] += numpy.conjugate(cibra[str1a,str1b])*ciket[str0a,str0b]*ov_list[p1,p2]*signa *signb
+
+        elif dspin == 'aa':
+            lidxa = fci.cistring.gen_linkstr_index(range(norb),nelaket)
+            for str0a in range(naket):
+                for a, i, str1a, signa in lidxa[str0a]:
+                    for str0b in range(nbket):
+                        p1 = conf_info_list_bra[str1a, str0b]
+                        p2 = conf_info_list_ket[str0a, str0b]
+                        rdm1[a,i] += numpy.conjugate(cibra[str1a,str0b])*ciket[str0a,str0b]*ov_list[p1,p2]*signa
+        
+        elif dspin == 'bb':
+            lidxb = fci.cistring.gen_linkstr_index(range(norb),nelbket)
+            for str0b in range(nbket):
+                for a, i , str1b, signb in lidxb[str0b]:
+                    for str0a in range(naket):
+                        p1 = conf_info_list_bra[str0a, str1b]
+                        p2 = conf_info_list_ket[str0a, str0b]
+                        rdm1[a,i] += numpy.conjugate(cibra[str0a,str1b])*ciket[str0a,str0b]* ov_list[p1,p2]*signb
+        return rdm1
+
 def fix_spin(fciobj, shift=PENALTY, ss=None, **kwargs):
     r'''If FCI solver cannot stay on spin eigenfunction, this function can
     add a shift to the states which have wrong spin.
