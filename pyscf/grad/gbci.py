@@ -486,13 +486,27 @@ def grad_elec(gbci_grad, ref_mo_coeff, ref_mo_energy, mo_list, moe_list,conf_inf
         de[k] -= numpy.einsum('xij,ji->x', s1[:,p0:p1], im1[:,p0:p1])
         
         de[k] -= numpy.einsum('xij,ij->x', s1[:,p0:p1], zeta[p0:p1]) 
-        de[k] -= numpy.einsum('xij,ji->x', s1[:,p0:p1], zeta[:,p0:p1]) 
+        de[k] -= numpy.einsum('xij,ji->x', s1[:,p0:p1], zeta[:,p0:p1])
 
         de[k] -= numpy.einsum('xij,ij->x', s1[:,p0:p1], vhf_s1occ[p0:p1]) * 2
         de[k] -= numpy.einsum('xij,ji->x', s1[:,p0:p1], vhf_s1occ[:,p0:p1]) * 2
           
     log.timer('GBCI nuclear gradients', *time0)
     return de
+
+# (ngroup, ngroup, nbas ,ncas)
+def get_h1eff_for_grad(mc, ref_mo, mo_cas, dmet_core_list):
+    hcore = mc.get_hcore()
+    nbas = ref_mo.shape[0]
+    ncas = mc.ncas
+    p = dmet_core_list.shape[0]
+    h1e = numpy.zeros((p,p,nbas,ncas))
+    ha1e = lib.einsum('ai,ab,bj->ij',ref_mo,hcore, mo_cas)
+    for i in range(0,p):
+        for j in range(0,p):
+            corevhf = mc.get_veff(dm = 2 * dmet_core_list[i,j].T, hermi = 0)
+            h1e[i,j] = ha1e + lib.einsum('ai, bj ,ab -> ij', ref_mo, mo_cas , corevhf)
+    return h1e
 
 def as_scanner(gbci_grad, state = None):
     if isinstance(gbci_grad, lib.GradScanner):
@@ -618,21 +632,6 @@ class Gradients(rhf_grad.GradientsBase):
             logger.note(self, '----------------------------------------------')
 
     as_scanner = as_scanner
-
-# (ngroup, ngroup, nbas ,ncas)
-def get_h1eff_for_grad(mc, ref_mo, mo_cas, dmet_core_list):
-    hcore = mc.get_hcore()
-    nbas = ref_mo.shape[0]
-    ncas = mc.ncas
-    p = dmet_core_list.shape[0]
-    h1e = numpy.zeros((p,p,nbas,ncas))
-    ecore_list = numpy.zeros(p)
-    ha1e = lib.einsum('ai,ab,bj->ij',ref_mo,hcore, mo_cas)
-    for i in range(0,p):
-        for j in range(0,p):
-            corevhf = mc.get_veff(dm = 2 * dmet_core_list[i,j].T, hermi = 0)
-            h1e[i,j] = ha1e + lib.einsum('ai, bj ,ab -> ij', ref_mo, mo_cas , corevhf)
-    return h1e
 
 if  __name__ == '__main__':
     from pyscf import scf, gto
