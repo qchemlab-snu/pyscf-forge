@@ -16,7 +16,7 @@ BOND_LENGTH = 1.5
 GROUP_A = {"atom": [0]}
 
 LIH_GRAD_Z = 0.0183010294
-LIF_GRAD_Z = 0.0354853450
+LIF_GRAD_Z = 0.0354853261
 
 
 def close_scf_resources(mf):

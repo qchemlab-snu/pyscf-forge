@@ -521,23 +521,12 @@ class GBCI_GradScanner(lib.GradScanner):
         
         gbci_scanner = self.base
 
-        e_tot, intermediates = gbci_scanner(mol, for_grad = True)
-        mo_list = intermediates['mo_list']
-        moe_list = intermediates['mo_energy']
-        conf_info_list = intermediates['conf_info_list']
-        dmet_core_list = intermediates['dmet_core_list']
-        ov_list = intermediates['ov_list']
-        ecore_list = intermediates['ecore_list']
-
-        ci = gbci_scanner.ci
+        e_tot = gbci_scanner(mol)
         if not isinstance(e_tot, float):
             if state >= gbci_scanner.fcisolver.nroots:
                 raise ValueError('State ID greater than the number of GBCI roots')
             e_tot = e_tot[state]
-            ci = ci[state]
-        de = self.kernel(ref_mo_coeff = gbci_scanner.mo_coeff, ref_mo_energy = gbci_scanner.mo_energy, 
-                        mo_list = mo_list, moe_list = moe_list, conf_info_list = conf_info_list, dmet_core_list = dmet_core_list, 
-                        ov_list = ov_list, ecore_list = ecore_list, ci=ci, state=state, **kwargs)
+        de = self.kernel(state=state, **kwargs)
         return e_tot, de
 
 
@@ -566,30 +555,40 @@ class Gradients(rhf_grad.GradientsBase):
             raise NotImplementedError('GBCI with ROHF reference orbitals is not implemented')
         return grad_elec(self, ref_mo_coeff, ref_mo_energy, mo_list, moe_list,conf_info_list, dmet_core_list, ov_list, ecore_list, ci, atmlst = atmlst, verbose = verbose)
 
-    def kernel(self, ref_mo_coeff = None, ref_mo_energy = None, mo_list = None, moe_list = None ,conf_info_list = None, dmet_core_list = None, ov_list = None, ecore_list = None, ci = None, atmlst = None,
-               state = None, verbose = None, debug = False):
-        log = logger.new_logger(self,verbose)
-        if ref_mo_coeff is None:
-            ref_mo_coeff = self.base.mo_coeff
-        if ref_mo_energy is None:    
-            ref_mo_energy = self.base._scf.mo_energy
-        if mo_list is None or moe_list is None or dmet_core_list is None or conf_info_list is None:
-            mo_list, moe_list, po_list, group = self.base.optimize_mo(ref_mo_coeff)
-            conf_info_list = group_info_list(self.base.ncas, self.base.nelecas, po_list, group)
-            if group is None:
-                po_list_or_group = po_list
-            else:
-                po_list_or_group = group
-            dmet_core_list, ov_list = self.base.get_svd_matrices(mo_list, po_list_or_group)
-            dmet_act_list = self.base.get_active_dm(ref_mo_coeff)
-            h1e, ecore_list = self.base.get_h1cas(dmet_act_list , mo_list , dmet_core_list)
+    def kernel(self, ci=None, atmlst=None, state=None, verbose=None):
+        intermediates = getattr(self.base, '_gbci_intermediates', None)
+        if intermediates is None:
+            raise RuntimeError(
+                'GBCI intermediates are unavailable. Run the GBCI kernel '
+                'before requesting gradients')
+
+        ref_mo_coeff = self.base.mo_coeff
+        ref_mo_energy = self.base._scf.mo_energy
+        mo_list = intermediates['mo_list']
+        moe_list = intermediates['mo_energy']
+        conf_info_list = intermediates['conf_info_list']
+        dmet_core_list = intermediates['dmet_core_list']
+        ov_list = intermediates['ov_list']
+        ecore_list = intermediates['ecore_list']
+
         if ci is None:
-            eri = self.base.get_h2eff(ref_mo_coeff)
-            max_memory = max(400, self.base.max_memory-lib.current_memory()[0])
-            e, ci = self.base.fcisolver.kernel(h1e, eri, self.base.ncas, self.base.nelecas,
-                                          conf_info_list, ov_list, ecore_list, 
-                                          verbose = log, max_memory = max_memory)
-        # ci = ci[state]
+            ci = self.base.ci
+        if ci is None:
+            raise RuntimeError(
+                'GBCI CI coefficients are unavailable. Run the GBCI kernel '
+                'before requesting gradients')
+
+        if state is None:
+            state = self.state
+        else:
+            self.state = state
+        nroots = getattr(self.base.fcisolver, 'nroots', 1)
+        if nroots > 1:
+            if state < 0 or state >= nroots:
+                raise ValueError(
+                    'State ID greater than the number of GBCI roots')
+            ci = ci[state]
+
         de = self.grad_elec(ref_mo_coeff, ref_mo_energy, mo_list, moe_list,conf_info_list,dmet_core_list, ov_list, ecore_list, ci, atmlst, verbose)
         self.de = de + self.grad_nuc(atmlst=atmlst)
         self._finalize()
@@ -727,26 +726,8 @@ if  __name__ == '__main__':
     mygbci = GBCI(mf, 4, (2,2), group_a = {"atom": [0]})
     mygbci.fcisolver.conv_tol = 1e-10
     gbci_grad = Gradients(mygbci)
-    mygbci.mo_coeff = mo_coeff
-    mo = mo_coeff
-    mo_list, moe_list, po_list, group = optimize_mo(mygbci, mo, group_a = {"atom": [0]})
-    p = mo_list.shape[0]
-    dmet_core_list, ov_list = mygbci.get_svd_matrices(mo_list, group)
-    dmet_act_list = mygbci.get_active_dm(mo)
-    h1e, ecore_list = mygbci.get_h1cas(dmet_act_list , mo_list , dmet_core_list)
-    
-    eri = mygbci.get_h2eff(mo)
-
-    ncas = mygbci.ncas
-    nelecas = mygbci.nelecas
-    conf_info_list = group_info_list(ncas, nelecas, po_list, group)
-
-    e, fcivec = mygbci.fcisolver.kernel(h1e, eri, ncas, nelecas,
-                                            conf_info_list, ov_list, ecore_list,
-                                            ci0=None, verbose=mol.verbose)
-    
-    ci = fcivec
-    de = gbci_grad.kernel(mo_coeff, mf.mo_energy, mo_list, moe_list, conf_info_list, dmet_core_list, ov_list, ecore_list, ci, debug = False)
+    mygbci.kernel(mo_coeff)
+    de = gbci_grad.kernel()
 
     ANG2BOHR = 1.0 / lib.param.BOHR
     nu_gbci = (e_new - e_tot)/(2*delta * ANG2BOHR)
