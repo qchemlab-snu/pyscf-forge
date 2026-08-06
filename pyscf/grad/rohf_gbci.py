@@ -1,3 +1,30 @@
+#!/usr/bin/env python
+#
+# Copyright 2026 The PySCF Developers. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Author: Jiseong Park <fark4308@snu.ac.kr>
+# Edited by: Seunghoon Lee <seunghoonlee@snu.ac.kr>
+
+"""
+Analytic gradients for GBCI
+
+This module provides nuclear gradients for GBCI calculations.
+
+Author: Jiseong Park <fark4308@snu.ac.kr>
+"""
+
 import numpy
 from functools import reduce
 from pyscf import lib
@@ -78,7 +105,6 @@ def grad_elec(
 
     casdm1 = ref_mo_coeff[:,ncore:ncore+ncas] @ ordm_list.sum(axis = (0,1)) @ ref_mo_coeff[:,ncore:ncore+ncas].T
     casdm2 = trdm_list.sum(axis = (0,1))
-    # hf_dm1 = mc._scf.make_rdm1(ref_mo_coeff, mo_occ)
     hcore_deriv = gbci_grad.hcore_generator(mol)
     s1 = gbci_grad.get_ovlp(mol)
 
