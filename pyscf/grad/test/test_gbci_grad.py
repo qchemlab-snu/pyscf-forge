@@ -73,23 +73,12 @@ class KnownValues(unittest.TestCase):
 
     def test_lih_triplet_rohf_2o2e(self):
         grad = get_gbci_grad(
-            f"Li 0 0 0; H 0 0 {BOND_LENGTH}",
-            2,
-            (1, 1),
-            spin=2,
-            mf_cls=scf.ROHF,
-        )
-        self.assertAlmostEqual(
-            float(grad[0, 2]), LIH_TRIPLET_ROHF_GRAD_Z, 9)
+            f"Li 0 0 0; H 0 0 {BOND_LENGTH}", 2, (1, 1), spin=2,mf_cls=scf.ROHF)
+        self.assertAlmostEqual(float(grad[0, 2]), LIH_TRIPLET_ROHF_GRAD_Z, 9)
 
     def test_lif_triplet_rohf_4o4e(self):
         grad = get_gbci_grad(
-            f"Li 0 0 0; F 0 0 {BOND_LENGTH}",
-            4,
-            (2, 2),
-            spin=2,
-            mf_cls=scf.ROHF,
-        )
+            f"Li 0 0 0; F 0 0 {BOND_LENGTH}",4,(2, 2),spin=2,mf_cls=scf.ROHF)
         self.assertAlmostEqual(
             float(grad[0, 2]), LIF_TRIPLET_ROHF_GRAD_Z, 9)
 
