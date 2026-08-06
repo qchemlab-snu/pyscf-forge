@@ -100,7 +100,7 @@ def kernel(gbci, mo_coeff=None, ci0=None, verbose=logger.NOTE):
     # SVD and core density matrix
     dmet_core_list, ov_list = gbci.get_svd_matrices(mo_list, svd_basis)
     t1 = log.timer('SVD and core density matrix', *t1)
-    
+
     # 1e
     dmet_act_list = gbci.get_active_dm(mo_coeff)
     h1e, ecore_list = gbci.get_h1cas(dmet_act_list, mo_list, dmet_core_list)
@@ -696,7 +696,7 @@ class GBCI_Scanner(lib.SinglePointScanner):
 
         self.mo_coeff = numpy.array(mo_coeff, copy=True)
         self.mol = mol
-        
+
         if ci0 is None:
             ci0 = self.ci
 
@@ -1425,9 +1425,6 @@ class GBCI(CASBase):
     def nuc_grad_method(self):
         # Dispatch by orbital source.  HF-CASCI and KS-CASCI have different
         # orbital-response equations.
-        from pyscf.scf import rohf
-        if isinstance(self._scf, rohf.ROHF):
-            raise NotImplementedError("ROHF-GBCI gradients are not implemented")
         from pyscf.grad import gbci
         return gbci.Gradients(self)
 

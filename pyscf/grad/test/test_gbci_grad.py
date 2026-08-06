@@ -17,6 +17,8 @@ GROUP_A = {"atom": [0]}
 
 LIH_GRAD_Z = 0.0183010294
 LIF_GRAD_Z = 0.0354853261
+LIH_TRIPLET_ROHF_GRAD_Z = 0.0294477687
+LIF_TRIPLET_ROHF_GRAD_Z = 0.0466725652
 
 
 def close_scf_resources(mf):
@@ -35,13 +37,14 @@ def close_gbci_resources(mc):
         close_scf_resources(fasscf)
 
 
-def get_gbci_grad(atom, ncas, nelecas):
+def get_gbci_grad(atom, ncas, nelecas, spin=0, mf_cls=scf.RHF):
     mol = gto.M(
         atom=atom,
         basis=BASIS,
+        spin=spin,
         verbose=0,
     )
-    mf = scf.RHF(mol)
+    mf = mf_cls(mol)
     mc = None
     try:
         mf.conv_tol = 1e-12
@@ -67,6 +70,28 @@ class KnownValues(unittest.TestCase):
         grad = get_gbci_grad(
             f"Li 0 0 0; F 0 0 {BOND_LENGTH}", 4, (2, 2))
         self.assertAlmostEqual(float(grad[0, 2]), LIF_GRAD_Z, 9)
+
+    def test_lih_triplet_rohf_2o2e(self):
+        grad = get_gbci_grad(
+            f"Li 0 0 0; H 0 0 {BOND_LENGTH}",
+            2,
+            (1, 1),
+            spin=2,
+            mf_cls=scf.ROHF,
+        )
+        self.assertAlmostEqual(
+            float(grad[0, 2]), LIH_TRIPLET_ROHF_GRAD_Z, 9)
+
+    def test_lif_triplet_rohf_4o4e(self):
+        grad = get_gbci_grad(
+            f"Li 0 0 0; F 0 0 {BOND_LENGTH}",
+            4,
+            (2, 2),
+            spin=2,
+            mf_cls=scf.ROHF,
+        )
+        self.assertAlmostEqual(
+            float(grad[0, 2]), LIF_TRIPLET_ROHF_GRAD_Z, 9)
 
 
 if __name__ == "__main__":

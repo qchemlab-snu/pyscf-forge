@@ -16,6 +16,7 @@ from pyscf import ao2mo
 from pyscf import scf
 from pyscf.fci import cistring
 from pyscf.scf import cphf
+from pyscf.scf import hf
 from pyscf.grad import rohf as rohf_grad
 from pyscf.grad import rhf as rhf_grad
 from pyscf.grad.mp2 import _shell_prange
@@ -40,11 +41,7 @@ def mo_to_um(ncas, ncore, ref_mo_coeff, mo_list, s1e):
 
 def make_D_matrix(U, V, s, thres = 1e-6):
     uvs = U[:, None, :] * V[None, :, :] / s[None, None, :]
-    ss = s**2
-    ss_dif = ss[:,None] - ss[None, :]
-    ss_pi = numpy.where(numpy.abs(ss_dif)<thres, 0, 1)
-    D = numpy.einsum('kli, rsi -> klrs',uvs,uvs)
-    D += numpy.einsum('pi, ksp, rli -> klrs', ss_pi, uvs ,uvs)
+    D = numpy.einsum('ksp, rli -> klrs', uvs ,uvs)
     return D
 
 def make_svd_list(um_list, ncore):
@@ -58,7 +55,7 @@ def make_svd_list(um_list, ncore):
             M_list[p1,p2] =um_list[p1].T @ um_list[p2]
             U, s, Vt = numpy.linalg.svd(M_list[p1,p2][:ncore,:ncore])
             W_list[p1,p2] = U @ numpy.diag(1/s) @ Vt
-            D_list[p1,p2] = make_D_matrix(U,Vt.T, s) 
+            D_list[p1,p2] = make_D_matrix(U,Vt.T, s)
     return D_list, W_list, M_list
 
 def make_1rdm_list(ci, ncas, nelecas, conf_info_list, ov_list):
@@ -134,7 +131,7 @@ def make_2rdm_list(ci, ncas, nelecas, conf_info_list, ov_list):
                                 *lib.einsum('pq,rs->pqrs',t1a[:,:,str1a,str0a],t1b[:,:,str1b,str0b])*ov_list[p1,p2]
                     trdm_list[p1,p2,:,:,:,:] += numpy.conjugate(ci[str1a,str1b])*ci[str0a,str0b]\
                                 *lib.einsum('pq,rs->pqrs', t1b[:,:,str1b,str0b],t1a[:,:,str1a,str0a])*ov_list[p1,p2]
-    return trdm_list 
+    return trdm_list
 
 def make_contracted_H_list(ci, ncas, nelecas, ncore, conf_info_list, h1eff, eri, ecore_list,ov_list):
     stringsa = cistring.make_strings(range(ncas), nelecas[0])
@@ -170,33 +167,38 @@ def make_contracted_H_list(ci, ncas, nelecas, ncore, conf_info_list, h1eff, eri,
         for str0b, stringb in enumerate(stringsb):
             p1 = conf_info_list[str1a, str0b]
             p2 = conf_info_list[str0a, str0b]
-            H_list[p1,p2] += h1eff[p1,p2, ncore + aa, ia] * t1a[aa,ia,str1a,str0a] *ci[str1a,str0b] * ci[str0a,str0b] * ov_list[p1,p2]
+            H_list[p1,p2] += h1eff[p1,p2, ncore + aa, ia] * t1a[aa,ia,str1a,str0a] * \
+                ci[str1a,str0b] * ci[str0a,str0b] * ov_list[p1,p2]
 
 
     for ab, ib, str1b, str0b in t1b_nonzero:
         for str0a, stringa in enumerate(stringsa):
             p1 = conf_info_list[str0a, str1b]
             p2 = conf_info_list[str0a, str0b]
-            H_list[p1,p2] += h1eff[p1,p2,ncore+ab, ib] * t1b[ab,ib,str1b,str0b] *ci[str0a, str1b] * ci[str0a, str0b] * ov_list[p1,p2]
+            H_list[p1,p2] += h1eff[p1,p2,ncore+ab, ib] * t1b[ab,ib,str1b,str0b] * \
+                ci[str0a, str1b] * ci[str0a, str0b] * ov_list[p1,p2]
 
     h2 = fci_slow.absorb_h1e(h1eff[0,0][ncore:ncore+ncas,:]*0, eri, ncas, nelecas)
     for aa, ia, str1a, str0a in t1a_nonzero:
         for ab, ib, str1b, str0b in t1b_nonzero:
             p1 = conf_info_list[str1a, str1b]
             p2 = conf_info_list[str0a, str0b]
-            H_list[p1,p2] += h2[aa,ia,ab,ib] * t1a[aa,ia,str1a,str0a] * t1b[ab,ib,str1b,str0b] *ci[str1a, str1b] *ci[str0a, str0b] * ov_list[p1,p2]
-    
+            H_list[p1,p2] += h2[aa,ia,ab,ib] * t1a[aa,ia,str1a,str0a] * \
+                t1b[ab,ib,str1b,str0b] *ci[str1a, str1b] *ci[str0a, str0b] * ov_list[p1,p2]
+
     for a1, i1, a2,i2, str1a, str0a in t2aa_nonzero:
         for str0b, stringb in enumerate(stringsb):
             p1 = conf_info_list[str1a, str0b]
             p2 = conf_info_list[str0a, str0b]
-            H_list[p1,p2] += h2[a1,i1,a2,i2] *t2aa[a1,i1,a2,i2,str1a,str0a] * ci[str1a, str0b] * ci[str0a, str0b] * ov_list[p1,p2] *.5
+            H_list[p1,p2] += h2[a1,i1,a2,i2] *t2aa[a1,i1,a2,i2,str1a,str0a] * \
+                ci[str1a, str0b] * ci[str0a, str0b] * ov_list[p1,p2] *.5
 
     for a1, i1, a2,i2, str1b, str0b in t2bb_nonzero:
         for str0a, stringa in enumerate(stringsa):
             p1 = conf_info_list[str0a, str1b]
             p2 = conf_info_list[str0a, str0b]
-            H_list[p1,p2] += h2[a1,i1,a2,i2] * t2bb[a1,i1,a2,i2,str1b,str0b] * ci[str0a, str1b] * ci[str0a, str0b] * ov_list[p1,p2] *.5
+            H_list[p1,p2] += h2[a1,i1,a2,i2] * t2bb[a1,i1,a2,i2,str1b,str0b] * \
+                ci[str0a, str1b] * ci[str0a, str0b] * ov_list[p1,p2] *.5
 
     for str0a, stringa in enumerate(stringsa):
         for str0b, stringb in enumerate(stringsb):
@@ -215,10 +217,9 @@ def get_X(gbci, h1eff, ov_list, ordm_list, trdm_list, um_list, H_list, group_pro
     bath = list(numpy.arange(0,ncore)) + list(numpy.arange(ncore+ncas, nbas))
     h1 = gbci._scf.get_hcore()
     mo_cas = ref_mo[:,ncore:ncore + ncas]
-    mo_core = ref_mo[:,:ncore]
     aapa = ao2mo.kernel(mol, (mo_cas, mo_cas, ref_mo, mo_cas), compact=False)
     aapa = aapa.reshape(ncas,ncas,nbas,ncas)
-    
+
     Xa = numpy.zeros((nbas, nbas))
     Xx = numpy.zeros(((num_group, nbas - ncas, nbas - ncas)))
     Xa[:,ncore:ncore+ncas] += lib.einsum('xwij, xwmj -> mi', ordm_list, h1eff)
@@ -230,7 +231,7 @@ def get_X(gbci, h1eff, ov_list, ordm_list, trdm_list, um_list, H_list, group_pro
     aapa = None
 
     D_list, W_list, M_list = make_svd_list(um_list, ncore)
- 
+
     for p1 in range(num_group):
         p1_mo = ref_mo[:,bath] @ um_list[p1]
         p1_core = p1_mo[:,:ncore]
@@ -249,21 +250,109 @@ def get_X(gbci, h1eff, ov_list, ordm_list, trdm_list, um_list, H_list, group_pro
             vhf_a = vj - vk *.5
 
             Xa[:,bath] += 2 * reduce(numpy.dot, (ref_mo.T, vhf_a, p2_core)) @ W_list[p1,p2].T @ um_list[p1][:,:ncore].T
-            Xa[:,bath] += 2 * numpy.array(reduce(numpy.dot, (p1_core.T, vhf_a, ref_mo))).T @ W_list[p1,p2] @ um_list[p2][:,:ncore].T
-            
+            Xa[:,bath] += 2 * numpy.array(reduce(numpy.dot, (p1_core.T, vhf_a, ref_mo))
+                                          ).T @ W_list[p1,p2] @ um_list[p2][:,:ncore].T
+
             vhf_a_mo = reduce(numpy.dot,(p1_mo.T, vhf_a, p2_mo)) * 2
             Xx[p1][:,:ncore] += 2* vhf_a_mo[:,:ncore] @ W_list[p1,p2].T
 
-           
+
             if p1 != p2:
-                Xx[p1][:,:ncore] -= lib.einsum('kl, ns, klrs -> nr', vhf_a_mo[:ncore,:ncore], M_list[p1,p2][:,:ncore], D_list[p1,p2])
-                Xx[p1][:,:ncore] -= lib.einsum('kl, ns, klsr -> nr', vhf_a_mo[:ncore,:ncore].T, M_list[p1,p2][:,:ncore], D_list[p2,p1])
+                Xx[p1][:,:ncore] -= lib.einsum('kl, ns, klrs -> nr', vhf_a_mo[:ncore,:ncore],
+                                               M_list[p1,p2][:,:ncore], D_list[p1,p2])
+                Xx[p1][:,:ncore] -= lib.einsum('kl, ns, klsr -> nr', vhf_a_mo[:ncore,
+                                               :ncore].T, M_list[p1,p2][:,:ncore], D_list[p2,p1])
                 Xx[p1][:,:ncore] += H_list[p1,p2] * M_list[p1,p2][:,:ncore] @ W_list[p1,p2].T * 4
 
     D_list = M_list = None
     return Xa, Xx
 
-def grad_elec(gbci_grad, ref_mo_coeff, ref_mo_energy, mo_list, moe_list,conf_info_list, dmet_core_list, ov_list, ecore_list, ci, atmlst = None, verbose = None):
+def _bath_rotation_zvec(mc, ref_mo_coeff, num_group, bath, mo_list, moe_list, um_list, conf_info_list, Xx):
+    mol = mc.mol
+    ncas = mc.ncas
+    ncore = mc.ncore
+    nelecas = mc.nelecas
+    nao = ref_mo_coeff.shape[0]
+
+    stringsa = cistring.make_strings(range(ncas),nelecas[0])
+    stringsb = cistring.make_strings(range(ncas),nelecas[1])
+
+    nb = len(stringsb)
+    mo_occ = numpy.zeros(nao - ncas)
+    mo_occ[:ncore] = 2
+    xzvec = numpy.zeros((num_group, nao - ncas, nao-ncas))
+    xzvec_ao = numpy.zeros((num_group, nao, nao))
+
+    #RHF for reference orbital
+    zy = numpy.zeros((nao, nao))
+    as_occ = numpy.zeros((num_group, ncas))
+
+    for p in range(num_group):
+        as_dm_a = numpy.zeros((nao,nao))
+        as_dm_b = numpy.zeros((nao,nao))
+        target_conf = numpy.where(conf_info_list == p)[0]
+        for conf in target_conf:
+            stra = conf // nb
+            strb = conf % nb
+            mo_occa = str2occ(stringsa[stra], ncas)
+            mo_occb = str2occ(stringsb[strb], ncas)
+            mo_occ = (mo_occa, mo_occb)
+            dm_a = hf.make_rdm1(ref_mo_coeff[:,ncore:ncore+ncas], mo_occa)
+            dm_b = hf.make_rdm1(ref_mo_coeff[:,ncore:ncore+ncas], mo_occb)
+            as_dm_a += dm_a
+            as_dm_b += dm_b
+        as_dm_a = as_dm_a / len(target_conf)
+        as_dm_b = as_dm_b / len(target_conf)
+        core_mo_coeff = mo_list[p][:, :ncore]
+        dm0_core = (core_mo_coeff ).dot(core_mo_coeff.conj().T)
+        dm = numpy.asarray((dm0_core  + as_dm_a , dm0_core + as_dm_b))
+        dm = dm[0] + dm[1]
+        # Bath rotations only couple doubly occupied core orbitals to empty
+        # virtual orbitals.  Their response is the restricted (charge)
+        # response even when the reference orbitals came from ROHF.
+        fock = mc.get_hcore(mol) + hf.get_veff(mol, dm)
+
+        fock = ref_mo_coeff.T @ fock @ mo_list[p]
+        xvo = Xx[p][ncore:,:ncore]
+        orbv = mo_list[p][:,ncore+ncas:]
+        orbo = mo_list[p][:,:ncore]
+        def fvind(x):
+            x = x.reshape(xvo.shape)
+            dm = reduce(numpy.dot, (orbv, x, orbo.T))
+            v = hf.get_veff(mol, dm + dm.T)
+            v = reduce(numpy.dot, (orbv.T, v, orbo))
+            return v * 2
+        mo_occ = numpy.zeros((len(bath)))
+        mo_occ[:ncore] = 2
+        dm1resp = cphf.solve(fvind, moe_list[p][bath], mo_occ, xvo, max_cycle=30, level_shift = 1e-5)[0]
+
+        xzvec[p][ncore:,:ncore] = dm1resp
+
+        zvec_ao = reduce(numpy.dot, (mo_list[p][:,bath], xzvec[p], mo_list[p][:,bath].T))
+        xzvec_ao[p] += zvec_ao
+        vj, vk = hf.get_jk(mol, zvec_ao.T, hermi = 0)
+        vhf_z = vj - vk * .5
+
+        zy[:,bath] += fock[:,bath] @ (xzvec[p] + xzvec[p].T) @ um_list[p].T
+        zy[:,bath] += 2 * reduce(numpy.dot, (ref_mo_coeff.T, vhf_z + vhf_z.T,
+                                 mo_list[p][:,:ncore])) @ um_list[p][:,:ncore].T
+        target_conf = numpy.where(conf_info_list == p)[0]
+        for conf in target_conf:
+            stra = conf // nb
+            strb = conf % nb
+            mo_occa = str2occ(stringsa[stra], ncas)
+            mo_occb = str2occ(stringsb[strb], ncas)
+            as_occ[p] += mo_occa + mo_occb
+        as_occ[p] = as_occ[p] / len(target_conf)
+        zy[:,ncore:ncore+ncas] += reduce(numpy.dot, (ref_mo_coeff.T, vhf_z + vhf_z.T,
+                                         ref_mo_coeff[:,ncore:ncore+ncas])) @ numpy.diag(as_occ[p])
+    return xzvec, xzvec_ao, zy, as_occ
+
+def grad_elec(
+    gbci_grad, ref_mo_coeff, ref_mo_energy, mo_list, moe_list,
+    conf_info_list, dmet_core_list, ov_list, ecore_list, ci,
+    atmlst=None, verbose=None,
+):
     mc = gbci_grad.base
     time0 = logger.process_clock(), logger.perf_counter()
     log = logger.new_logger(gbci_grad, verbose)
@@ -279,10 +368,6 @@ def grad_elec(gbci_grad, ref_mo_coeff, ref_mo_energy, mo_list, moe_list,conf_inf
     num_group = mo_list.shape[0]
 
     s1e = mc._scf.get_ovlp(mol)
-    stringsa = cistring.make_strings(range(ncas),nelecas[0])
-    stringsb = cistring.make_strings(range(ncas),nelecas[1])
-    
-    nb = len(stringsb)
     um_list = mo_to_um(ncas, ncore, ref_mo_coeff, mo_list, s1e)
 
     mo_cas = ref_mo_coeff[:,ncore:nocc]
@@ -300,68 +385,8 @@ def grad_elec(gbci_grad, ref_mo_coeff, ref_mo_energy, mo_list, moe_list,conf_inf
         group_prob[i] = (numpy.abs(ci)**2)[group_where].sum()
     Xa, Xx  = get_X(mc, h1eff, ov_list, ordm_list, trdm_list, um_list, H_list, group_prob)
 
-    mo_occ = numpy.zeros(nao - ncas)
-    mo_occ[:ncore] = 2
-    xzvec = numpy.zeros((num_group, nao - ncas, nao-ncas))
-    xzvec_ao = numpy.zeros((num_group, nao, nao))
-
-    #RHF for reference orbital
-    zy = numpy.zeros((nao, nao))
-    as_occ = numpy.zeros((num_group, ncas))
-    
-    for p in range(num_group):
-        as_dm_a = numpy.zeros((nao,nao))
-        as_dm_b = numpy.zeros((nao,nao))
-        target_conf = numpy.where(conf_info_list == p)[0]
-        for conf in target_conf:
-            stra = conf // nb
-            strb = conf % nb
-            mo_occa = str2occ(stringsa[stra], ncas)
-            mo_occb = str2occ(stringsb[strb], ncas)
-            mo_occ = (mo_occa, mo_occb)
-            dm_a = mc._scf.make_rdm1(ref_mo_coeff[:,ncore:ncore+ncas], mo_occa)
-            dm_b = mc._scf.make_rdm1(ref_mo_coeff[:,ncore:ncore+ncas], mo_occb)
-            as_dm_a += dm_a
-            as_dm_b += dm_b
-        as_dm_a = as_dm_a / len(target_conf)
-        as_dm_b = as_dm_b / len(target_conf)
-        core_mo_coeff = mo_list[p][:, :ncore]
-        dm0_core = (core_mo_coeff ).dot(core_mo_coeff.conj().T)
-        dm = numpy.asarray((dm0_core  + as_dm_a , dm0_core + as_dm_b))
-        dm = dm[0] + dm[1]
-        fock = mc._scf.get_fock(dm = dm)
-        fock = ref_mo_coeff.T @ fock @ mo_list[p]
-        xvo = Xx[p][ncore:,:ncore]
-        orbv = mo_list[p][:,ncore+ncas:]
-        orbo = mo_list[p][:,:ncore]
-        def fvind(x):
-            x = x.reshape(xvo.shape)
-            dm = reduce(numpy.dot, (orbv, x, orbo.T))
-            v = mc._scf.get_veff(mol, dm + dm.T)
-            v = reduce(numpy.dot, (orbv.T, v, orbo)) 
-            return v * 2
-        mo_occ = numpy.zeros((len(bath)))
-        mo_occ[:ncore] = 2
-        dm1resp = cphf.solve(fvind, moe_list[p][bath], mo_occ, xvo, max_cycle=30, level_shift = 1e-5)[0]
-
-        xzvec[p][ncore:,:ncore] = dm1resp 
-        
-        zvec_ao = reduce(numpy.dot, (mo_list[p][:,bath], xzvec[p], mo_list[p][:,bath].T))
-        xzvec_ao[p] += zvec_ao 
-        vj, vk = mc._scf.get_jk(mol, zvec_ao.T, hermi = 0)
-        vhf_z = vj - vk * .5
-
-        zy[:,bath] += fock[:,bath] @ (xzvec[p] + xzvec[p].T) @ um_list[p].T
-        zy[:,bath] += 2 * reduce(numpy.dot, (ref_mo_coeff.T, vhf_z + vhf_z.T, mo_list[p][:,:ncore])) @ um_list[p][:,:ncore].T
-        target_conf = numpy.where(conf_info_list == p)[0]
-        for conf in target_conf:
-            stra = conf // nb  
-            strb = conf % nb
-            mo_occa = str2occ(stringsa[stra], ncas)
-            mo_occb = str2occ(stringsb[strb], ncas)
-            as_occ[p] += mo_occa + mo_occb
-        as_occ[p] = as_occ[p] / len(target_conf)
-        zy[:,ncore:ncore+ncas] += reduce(numpy.dot, (ref_mo_coeff.T, vhf_z + vhf_z.T, ref_mo_coeff[:,ncore:ncore+ncas])) @ numpy.diag(as_occ[p]) 
+    xzvec, xzvec_ao, zy, as_occ = _bath_rotation_zvec(
+        mc, ref_mo_coeff, num_group, bath, mo_list, moe_list, um_list, conf_info_list, Xx)
 
     orbv = ref_mo_coeff[:,neleca:]
     orbo = ref_mo_coeff[:,:neleca]
@@ -373,7 +398,24 @@ def grad_elec(gbci_grad, ref_mo_coeff, ref_mo_energy, mo_list, moe_list,conf_inf
     azvec[ncore:neleca,:ncore] = Imat[ncore:neleca,:ncore] / -ee[ncore:neleca,:ncore]
     azvec[nocc:,neleca:nocc] = Imat[nocc:,neleca:nocc] / -ee[nocc:,neleca:nocc]
     azvec[neleca:nocc,nocc:] = Imat[neleca:nocc,nocc:] / -ee[neleca:nocc,nocc:]
-    zvec_ao = reduce(numpy.dot, (ref_mo_coeff, azvec+azvec.T, ref_mo_coeff.T)) 
+    active_same_pairs = []
+    for space in (
+        numpy.arange(ncore, neleca),
+        numpy.arange(neleca, nocc),
+    ):
+        for p_pos, p in enumerate(space):
+            for q in space[:p_pos]:
+                denominator = ref_mo_energy[p] - ref_mo_energy[q]
+                gradient = Imat[p, q] - Imat[q, p]
+                if abs(denominator) < 1e-10:
+                    if abs(gradient) > 1e-8:
+                        raise RuntimeError(
+                            'Degenerate active-active response is ambiguous')
+                    continue
+                weight = -gradient / denominator
+                azvec[p, q] = weight
+                active_same_pairs.append((p, q))
+    zvec_ao = reduce(numpy.dot, (ref_mo_coeff, azvec+azvec.T, ref_mo_coeff.T))
     vhf = mc._scf.get_veff(mol, zvec_ao) * 2
     xvo = reduce(numpy.dot, (orbv.T, vhf, orbo))
     xvo += Imat[neleca:, :neleca] - Imat[:neleca, neleca:].T
@@ -381,7 +423,7 @@ def grad_elec(gbci_grad, ref_mo_coeff, ref_mo_energy, mo_list, moe_list,conf_inf
         x = x.reshape(xvo.shape)
         dm = reduce(numpy.dot, (orbv, x, orbo.T))
         v = mc._scf.get_veff(mol, dm + dm.T)
-        v = reduce(numpy.dot, (orbv.T, v, orbo)) 
+        v = reduce(numpy.dot, (orbv.T, v, orbo))
         return v * 2
     mo_occ = numpy.zeros((nao))
     mo_occ[:neleca] = 2
@@ -389,16 +431,19 @@ def grad_elec(gbci_grad, ref_mo_coeff, ref_mo_energy, mo_list, moe_list,conf_inf
     azvec[neleca:, :neleca] = dm1resp
 
     zeta = numpy.einsum('ij,j->ij', azvec, ref_mo_energy)
-    zeta = reduce(numpy.dot, (ref_mo_coeff, zeta, ref_mo_coeff.T)) 
+    zeta = reduce(numpy.dot, (ref_mo_coeff, zeta, ref_mo_coeff.T))
     zvec_ao = reduce(numpy.dot, (ref_mo_coeff, azvec+azvec.T, ref_mo_coeff.T)) *.5
     p1 = numpy.dot(ref_mo_coeff[:,:neleca], ref_mo_coeff[:,:neleca].T)
     vhf_s1occ = reduce(numpy.dot, (p1, mc._scf.get_veff(mol, zvec_ao), p1))
 
-    
+
     Imat[:ncore,ncore:neleca] = 0
     Imat[ncore:neleca,:ncore] = 0
     Imat[nocc:,neleca:nocc] = 0
     Imat[neleca:nocc,nocc:] = 0
+    for p, q in active_same_pairs:
+        Imat[p, q] = 0
+        Imat[q, p] = 0
     Imat[neleca:,:neleca] = Imat[:neleca,neleca:].T
     im1 = reduce(numpy.dot, (ref_mo_coeff, Imat, ref_mo_coeff.T)) * .5
 
@@ -428,7 +473,7 @@ def grad_elec(gbci_grad, ref_mo_coeff, ref_mo_energy, mo_list, moe_list,conf_inf
     dm_acts = numpy.einsum('pa, xa, qa -> xpq', mo_cas, as_occ, mo_cas)
     dms = dm_cores + dm_acts
     xz = numpy.asarray(xzvec_ao)
-    ordm_aos = numpy.einsum('pa,xwab,qb->xwpq', mo_cas, ordm_list, mo_cas, optimize=True) 
+    ordm_aos = numpy.einsum('pa,xwab,qb->xwpq', mo_cas, ordm_list, mo_cas, optimize=True)
 
     max_memory = gbci_grad.max_memory - lib.current_memory()[0]
     blksize = int(max_memory*.9e6/8 / ((aoslices[:,3]-aoslices[:,2]).max()*nao_pair))
@@ -437,7 +482,7 @@ def grad_elec(gbci_grad, ref_mo_coeff, ref_mo_energy, mo_list, moe_list,conf_inf
         shl0, shl1, p0, p1 = aoslices[ia]
         h1ao = hcore_deriv(ia)
         de[k] += numpy.einsum('xij, ij ->x', h1ao, casdm1)
-        de[k] += numpy.einsum('xij, ij ->x', h1ao, zvec_ao) 
+        de[k] += numpy.einsum('xij, ij ->x', h1ao, zvec_ao)
         de[k] += numpy.einsum('xij, pij ->x', h1ao, xzvec_ao)
         for x in range(num_group):
             dm_core = dm_cores[x]
@@ -466,31 +511,38 @@ def grad_elec(gbci_grad, ref_mo_coeff, ref_mo_energy, mo_list, moe_list,conf_inf
                 de[k,i] += numpy.einsum('ijkl,il,kj', eri1tmp, hf_dm1[p0:p1], zvec_ao[:,q0:q1])
                 de[k,i] += numpy.einsum('ijkl,jk,il', eri1tmp, hf_dm1[q0:q1], zvec_ao[p0:p1])
 
-                de[k,i] -= 2 * numpy.einsum('ijkl, xlk, xij, x ->', eri1tmp, dm_cores, dm_cores[:,p0:p1, q0:q1], group_prob, optimize = True)
-                de[k,i] += numpy.einsum('ijkl, xjk, xil, x ->', eri1tmp, dm_cores[:,q0:q1,:], dm_cores[:,p0:p1, :], group_prob, optimize = True)
+                de[k,i] -= 2 * numpy.einsum('ijkl, xlk, xij, x ->', eri1tmp, dm_cores,
+                                            dm_cores[:,p0:p1, q0:q1], group_prob, optimize = True)
+                de[k,i] += numpy.einsum('ijkl, xjk, xil, x ->', eri1tmp, dm_cores[:,q0:q1,:],
+                                        dm_cores[:,p0:p1, :], group_prob, optimize = True)
 
                 de[k,i] -= numpy.einsum('ijkl, xij, xkl ->', eri1tmp, xz_pq_sym, dms, optimize = True)
                 de[k,i] -= 2 * numpy.einsum('ijkl, xkl, xij ->', eri1tmp, xz, dms[:,p0:p1, q0:q1], optimize = True)
                 de[k,i] += 0.5 * numpy.einsum('ijkl, xil, xjk ->', eri1tmp, xz_p_sym, dms[:,q0:q1,:], optimize = True)
                 de[k,i] += 0.5 * numpy.einsum('ijkl, xjl, xik ->', eri1tmp, xz_q_sym, dms[:,p0:p1,:], optimize = True)
-                
-                de[k,i] -= 2 * numpy.einsum('ijkl, xwij, xwkl ->', eri1tmp, ordm_pq_sym, dmet_core_list, optimize = True)
+
+                de[k,i] -= 2 * numpy.einsum('ijkl, xwij, xwkl ->', eri1tmp, ordm_pq_sym,
+                                            dmet_core_list, optimize = True)
                 de[k,i] -= 2 * numpy.einsum('ijkl, xwkl, xwij ->', eri1tmp, ordm_aos, dmet_pq_sym, optimize = True)
-                de[k,i] += numpy.einsum('ijkl, xwil, xwkj', eri1tmp, ordm_aos[:, :, p0:p1, :], dmet_core_list[:, :, :,q0:q1], optimize = True)
-                de[k,i] += numpy.einsum('ijkl, xwjl, xwki', eri1tmp, ordm_aos[:, :, q0:q1, :], dmet_core_list[:, :, :,p0:p1], optimize = True)
-                de[k,i] += numpy.einsum('ijkl, xwkj, xwil', eri1tmp, ordm_aos[:,:,:,q0:q1], dmet_core_list[:,:,p0:p1,:], optimize = True)
-                de[k,i] += numpy.einsum('ijkl, xwli, xwjk', eri1tmp, ordm_aos[:,:,:,p0:p1], dmet_core_list[:,:,q0:q1,:], optimize = True)
+                de[k,i] += numpy.einsum('ijkl, xwil, xwkj', eri1tmp, ordm_aos[:, :, p0:p1, :],
+                                        dmet_core_list[:, :, :,q0:q1], optimize = True)
+                de[k,i] += numpy.einsum('ijkl, xwjl, xwki', eri1tmp, ordm_aos[:, :, q0:q1, :],
+                                        dmet_core_list[:, :, :,p0:p1], optimize = True)
+                de[k,i] += numpy.einsum('ijkl, xwkj, xwil', eri1tmp, ordm_aos[:,:,:,q0:q1],
+                                        dmet_core_list[:,:,p0:p1,:], optimize = True)
+                de[k,i] += numpy.einsum('ijkl, xwli, xwjk', eri1tmp, ordm_aos[:,:,:,p0:p1],
+                                        dmet_core_list[:,:,q0:q1,:], optimize = True)
 
             eri1 = eri1tmp = None
         de[k] -= numpy.einsum('xij,ij->x', s1[:,p0:p1], im1[p0:p1])
         de[k] -= numpy.einsum('xij,ji->x', s1[:,p0:p1], im1[:,p0:p1])
-        
-        de[k] -= numpy.einsum('xij,ij->x', s1[:,p0:p1], zeta[p0:p1]) 
+
+        de[k] -= numpy.einsum('xij,ij->x', s1[:,p0:p1], zeta[p0:p1])
         de[k] -= numpy.einsum('xij,ji->x', s1[:,p0:p1], zeta[:,p0:p1])
 
         de[k] -= numpy.einsum('xij,ij->x', s1[:,p0:p1], vhf_s1occ[p0:p1]) * 2
         de[k] -= numpy.einsum('xij,ji->x', s1[:,p0:p1], vhf_s1occ[:,p0:p1]) * 2
-          
+
     log.timer('GBCI nuclear gradients', *time0)
     return de
 
@@ -521,7 +573,7 @@ class GBCI_GradScanner(lib.GradScanner):
         lib.GradScanner.__init__(self, g)
         if state is not None:
             self.state = state
-    
+
     def __call__(self, mol_or_geom, state = None, **kwargs):
         if isinstance(mol_or_geom, gto.MoleBase):
             assert mol_or_geom.__class__ == gto.Mole
@@ -532,7 +584,7 @@ class GBCI_GradScanner(lib.GradScanner):
 
         if state is None:
             state = self.state
-        
+
         gbci_scanner = self.base
 
         e_tot = gbci_scanner(mol)
@@ -564,10 +616,23 @@ class Gradients(rhf_grad.GradientsBase):
                  self.max_memory, lib.current_memory()[0])
         return self
 
-    def grad_elec(self, ref_mo_coeff, ref_mo_energy, mo_list, moe_list,conf_info_list, dmet_core_list, ov_list, ecore_list, ci, atmlst = None, verbose = None):
+    def grad_elec(
+        self, ref_mo_coeff, ref_mo_energy, mo_list, moe_list,
+        conf_info_list, dmet_core_list, ov_list, ecore_list, ci,
+        atmlst=None, verbose=None,
+    ):
         if isinstance(self.base._scf, scf.rohf.ROHF):
-            raise NotImplementedError('GBCI with ROHF reference orbitals is not implemented')
-        return grad_elec(self, ref_mo_coeff, ref_mo_energy, mo_list, moe_list,conf_info_list, dmet_core_list, ov_list, ecore_list, ci, atmlst = atmlst, verbose = verbose)
+            from pyscf.grad import rohf_gbci
+            return rohf_gbci.grad_elec(
+                self, ref_mo_coeff, ref_mo_energy, mo_list, moe_list,
+                conf_info_list, dmet_core_list, ov_list, ecore_list, ci,
+                atmlst=atmlst, verbose=verbose,
+            )
+        return grad_elec(
+            self, ref_mo_coeff, ref_mo_energy, mo_list, moe_list,
+            conf_info_list, dmet_core_list, ov_list, ecore_list, ci,
+            atmlst=atmlst, verbose=verbose,
+        )
 
     def kernel(self, ci=None, atmlst=None, state=None, verbose=None):
         intermediates = getattr(self.base, '_gbci_intermediates', None)
@@ -603,7 +668,8 @@ class Gradients(rhf_grad.GradientsBase):
                     'State ID greater than the number of GBCI roots')
             ci = ci[state]
 
-        de = self.grad_elec(ref_mo_coeff, ref_mo_energy, mo_list, moe_list,conf_info_list,dmet_core_list, ov_list, ecore_list, ci, atmlst, verbose)
+        de = self.grad_elec(ref_mo_coeff, ref_mo_energy, mo_list, moe_list,conf_info_list,
+                            dmet_core_list, ov_list, ecore_list, ci, atmlst, verbose)
         self.de = de + self.grad_nuc(atmlst=atmlst)
         self._finalize()
         return self.de
@@ -633,8 +699,7 @@ class Gradients(rhf_grad.GradientsBase):
 
     as_scanner = as_scanner
 
-if  __name__ == '__main__':
-    from pyscf import scf, gto
+if __name__ == '__main__':
     import matplotlib.pyplot as plt
     import pandas as pd
     lib.num_threads(1)
@@ -653,7 +718,6 @@ if  __name__ == '__main__':
     mo_coeff = mf.mo_coeff
     e_hf = mf.e_tot
 
-    from pyscf.mcscf import addons
     mygbci = GBCI(mf, 4, (2,2), group_a = {"atom": [0]})
     mygbci.fcisolver.conv_tol = 1e-10
     gbci_grad = Gradients(mygbci)
@@ -674,7 +738,7 @@ if  __name__ == '__main__':
                                             conf_info_list, ov_list, ecore_list,
                                             ci0=None, verbose=mol.verbose)
 
-    
+
     mol = gto.Mole()
     mol.verbose = 5
     mol.output = None
@@ -721,7 +785,6 @@ if  __name__ == '__main__':
 
     mo_coeff = mf.mo_coeff
 
-    from pyscf.mcscf import addons
     mygbci = GBCI(mf, 4, (2,2), group_a = {"atom": [0]})
     mygbci.fcisolver.conv_tol = 1e-10
     gbci_grad = Gradients(mygbci)
@@ -730,6 +793,6 @@ if  __name__ == '__main__':
 
     ANG2BOHR = 1.0 / lib.param.BOHR
     nu_gbci = (e_new - e_tot)/(2*delta * ANG2BOHR)
-    
+
     print("Diff: %.12f " % (nu_gbci - de[1][2]))
     print("Numerical gradient: %.12f" % nu_gbci)
