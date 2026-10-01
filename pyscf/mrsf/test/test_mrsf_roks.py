@@ -52,7 +52,7 @@ class KnownValues(unittest.TestCase):
 
     def test_emrsf_hf(self):
         e = self.kernel(mrsf.TDA_EMRSF(self.mf_hf))
-        ref = [-0.2383341019, 0.0264367386, 0.0966347311, 0.1074310566]
+        ref = [-0.2375686640, 0.0264363264, 0.1074310566, 0.1216566060]
         self.assertAlmostEqual(abs(e - ref).max(), 0, delta=1e-6)
 
     def test_mrsf_bhhlyp(self):
@@ -62,7 +62,7 @@ class KnownValues(unittest.TestCase):
 
     def test_emrsf_bhhlyp(self):
         e = self.kernel(mrsf.TDA_EMRSF(self.mf_bhhlyp))
-        ref = [-0.2780226768, 0.0456436288, 0.1052674108, 0.1128193133]
+        ref = [-0.2779435065, 0.0456435834, 0.1052674108, 0.1176677472]
         self.assertAlmostEqual(abs(e - ref).max(), 0, delta=1e-6)
 
     def test_matrix_free_equals_dense(self):

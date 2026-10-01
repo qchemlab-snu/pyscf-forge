@@ -90,15 +90,6 @@ def _occ_diag(mf, nocc):
     return jdiag, kdiag
 
 
-def _ao2mo(mf, mos):
-    shape = [m.shape[1] for m in mos]
-    if getattr(mf, 'with_df', None) is not None:
-        eri = mf.with_df.ao2mo(mos, compact=False)
-    else:
-        eri = ao2mo.general(mf.mol, mos, compact=False)
-    return eri.reshape(shape)
-
-
 def spin_pair_block(kmo, hyb, cidx, oidx, vidx):
     '''Spin-pairing coupling (Slater-Condon) in the CV + OV + CO basis from open-open K.'''
     nc, nv = len(cidx), len(vidx)
@@ -122,8 +113,10 @@ def spin_pair_block(kmo, hyb, cidx, oidx, vidx):
     return hyb * cmat
 
 
-def mrsf_hop(mf, hyb, spc, focka, fockb, jmo, kmo, cidx, oidx, vidx, occ_diag=None):
-    '''MRSF part: forge collinear SF-TDA projected onto [G, D, L-R] + CV + OV + CO.'''
+def mrsf_hop(mf, hyb, spc, focka, fockb, jmo, kmo, cidx, oidx, vidx, occ_diag=None,
+             singlet=True):
+    '''MRSF part: forge collinear SF-TDA projected onto [G, D, L-R] + CV + OV + CO
+    (singlet) or [L+R] + CV + OV + CO (triplet).'''
     o1, o2 = oidx
     nc, nv = len(cidx), len(vidx)
     nvirb = nv + 2
@@ -132,50 +125,65 @@ def mrsf_hop(mf, hyb, spc, focka, fockb, jmo, kmo, cidx, oidx, vidx, occ_diag=No
     cols = numpy.vstack((pairs(cidx, vidx), pairs(oidx, vidx), pairs(cidx, oidx)))
     i456 = xi(cols[:, 0], cols[:, 1])
     i_g, i_d, i_11, i_22 = xi(o2, o1), xi(o1, o2), xi(o1, o1), xi(o2, o2)
-    nm = 3 + len(cols)
-    cmat = spin_pair_block(kmo, hyb, cidx, oidx, vidx) if spc else None
+    noo = 3 if singlet else 1
+    nm = noo + len(cols)
+    # the spin-pairing coupling enters with - for singlets and + for triplets
+    cmat = spin_pair_block(kmo, hyb, cidx, oidx, vidx) * (-1 if singlet else 1) if spc else None
 
     hd = numpy.empty(nm)
-    hd[0] = fockb[o1, o1] - focka[o2, o2] - hyb * jmo[1, 1][o1, o1]
-    hd[1] = fockb[o2, o2] - focka[o1, o1] - hyb * jmo[0, 0][o2, o2]
-    hd[2] = (.5 * (fockb[o1, o1] - focka[o1, o1] - hyb * jmo[0, 0][o1, o1])
-             + .5 * (fockb[o2, o2] - focka[o2, o2] - hyb * jmo[1, 1][o2, o2])
-             + .5 * hyb * (kmo[0, 0][o2, o2] + kmo[1, 1][o1, o1]))
+    lr_diag = (.5 * (fockb[o1, o1] - focka[o1, o1] - hyb * jmo[0, 0][o1, o1])
+               + .5 * (fockb[o2, o2] - focka[o2, o2] - hyb * jmo[1, 1][o2, o2]))
+    lr_k = .5 * hyb * (kmo[0, 0][o2, o2] + kmo[1, 1][o1, o1])
+    if singlet:
+        hd[0] = fockb[o1, o1] - focka[o2, o2] - hyb * jmo[1, 1][o1, o1]
+        hd[1] = fockb[o2, o2] - focka[o1, o1] - hyb * jmo[0, 0][o2, o2]
+        hd[2] = lr_diag + lr_k
+    else:
+        hd[0] = lr_diag - lr_k
     if occ_diag is None:
         occ_diag = _occ_diag(mf, nc + 2)
     # the Coulomb term (pp|qq) is large in spin-flip; without it Davidson can miss roots
-    hd[3:] = (fockb[cols[:, 1], cols[:, 1]] - focka[cols[:, 0], cols[:, 0]]
-              - hyb * occ_diag[0][cols[:, 0], cols[:, 1]])
+    hd[noo:] = (fockb[cols[:, 1], cols[:, 1]] - focka[cols[:, 0], cols[:, 0]]
+                - hyb * occ_diag[0][cols[:, 0], cols[:, 1]])
     if spc:
-        hd[3:] -= cmat.diagonal()
+        hd[noo:] += cmat.diagonal()
 
     def mrsf_part(xm):
         nvec = xm.shape[0]
         xs = numpy.zeros((nvec, (nc + 2) * nvirb))
-        xs[:, i_g] = xm[:, 0]
-        xs[:, i_d] = xm[:, 1]
-        xs[:, i_11] = xm[:, 2] / SQRT2
-        xs[:, i_22] = -xm[:, 2] / SQRT2
-        xs[:, i456] = xm[:, 3:]
+        if singlet:
+            xs[:, i_g] = xm[:, 0]
+            xs[:, i_d] = xm[:, 1]
+            xs[:, i_11] = xm[:, 2] / SQRT2
+            xs[:, i_22] = -xm[:, 2] / SQRT2
+        else:
+            xs[:, i_11] = xm[:, 0] / SQRT2
+            xs[:, i_22] = xm[:, 0] / SQRT2
+        xs[:, i456] = xm[:, noo:]
         ys = numpy.asarray(vind_sf(xs)).reshape(nvec, -1)
         ym = numpy.empty_like(xm)
-        ym[:, 0] = ys[:, i_g]
-        ym[:, 1] = ys[:, i_d]
-        ym[:, 2] = (ys[:, i_11] - ys[:, i_22]) / SQRT2
-        ym[:, 3:] = ys[:, i456]
+        if singlet:
+            ym[:, 0] = ys[:, i_g]
+            ym[:, 1] = ys[:, i_d]
+            ym[:, 2] = (ys[:, i_11] - ys[:, i_22]) / SQRT2
+        else:
+            ym[:, 0] = (ys[:, i_11] + ys[:, i_22]) / SQRT2
+        ym[:, noo:] = ys[:, i456]
         if spc:
-            ym[:, 3:] -= xm[:, 3:].dot(cmat)
+            ym[:, noo:] += xm[:, noo:].dot(cmat)
         return ym
     return mrsf_part, hd
 
 
-def ext_hop(mf, hyb, xc_cv, a00, focka, fockb, jmo, kmo, cidx, oidx, vidx, occ_diag=None):
+def ext_hop(mf, hyb, xc_cv, a00, focka, fockb, jmo, kmo, cidx, oidx, vidx, occ_diag=None,
+            singlet=True):
     '''EMRSF extension: CV block (pyscf TDA on the closed-shell proxy) and the
     D coupling to the MRSF space, from batched AO J/K.'''
     o1, o2 = oidx
     nc, nv = len(cidx), len(vidx)
     ncv = nc * nv
-    nm = (nc + 2) * (nv + 2) - 1
+    noo = 3 if singlet else 1
+    nm = (nc + 2) * (nv + 2) - 4 + noo
     c = mf.mo_coeff
     cc_, cv_ = c[:, cidx], c[:, vidx]
     co1, co2 = c[:, [o1]], c[:, [o2]]
@@ -183,37 +191,67 @@ def ext_hop(mf, hyb, xc_cv, a00, focka, fockb, jmo, kmo, cidx, oidx, vidx, occ_d
     mf_cv, f_cv, hyb_cv = cv_proxy(mf, xc_cv)
     mf_cv.mo_energy = f_cv.diagonal().copy()
     td_cv = tdscf.rhf.TDA(mf_cv)
+    td_cv.singlet = singlet
     td_cv.verbose = 0
     vind_cv, hdiag_cv = td_cv.gen_vind()
     dsh = jmo[0, 0].diagonal() - jmo[1, 1].diagonal()
     sh_ia = (dsh[vidx][None, :] - dsh[cidx][:, None]).ravel()
     diag_cv = a00 - (1 - hyb_cv) * sh_ia
+    # off-diagonal F' = F_cv + (1-hyb)[(pq|O2O2) - (pq|O1O1)] (cf. rohf_mrsf.cv_offdiag_fock)
+    fcv = f_cv + (1 - hyb_cv) * (jmo[1, 1] - jmo[0, 0])
+    fo_off = fcv[numpy.ix_(cidx, cidx)].copy()
+    fv_off = fcv[numpy.ix_(vidx, vidx)].copy()
+    fo_off[numpy.diag_indices_from(fo_off)] = 0
+    fv_off[numpy.diag_indices_from(fv_off)] = 0
     if occ_diag is None:
         occ_diag = _occ_diag(mf, nc + 2)
     jdiag, kdiag = occ_diag[0][numpy.ix_(cidx, vidx)], occ_diag[1][numpy.ix_(cidx, vidx)]
+    # A_ia,ia = e_ia + 2(ia|ia) - hyb (ii|aa) for singlets, e_ia - hyb (ii|aa) for triplets
     hd_cv = (hdiag_cv.reshape(nc + 1, nv + 1)[:-1, 1:].ravel() + diag_cv
-             + (2 * kdiag - hyb_cv * jdiag).ravel())
+             + ((2 * kdiag if singlet else 0) - hyb_cv * jdiag).ravel())
 
     j12, k12, k21 = jmo[0, 1], kmo[0, 1], kmo[1, 0]
     row_g = f_cv[numpy.ix_(cidx, vidx)]
-    row_lr = (k12 - 2 * j12)[numpy.ix_(cidx, vidx)] / SQRT2
+    if singlet:
+        row_lr = (k12 - 2 * j12)[numpy.ix_(cidx, vidx)] / SQRT2
+    else:
+        row_lr = k12[numpy.ix_(cidx, vidx)] / SQRT2
     k21_cc = k21[numpy.ix_(cidx, cidx)]
     k12_vv = k12[numpy.ix_(vidx, vidx)]
     j12_o1c = j12[o1, cidx]
     j12_o2v = j12[o2, vidx]
-    t1 = numpy.einsum('qrq->qr', _ao2mo(mf, (co1, cv_, cc_, cv_)).reshape(nv, nc, nv))
-    t2 = numpy.einsum('rqq->qr', _ao2mo(mf, (co1, cc_, cv_, cv_)).reshape(nc, nv, nv))
-    u1 = numpy.einsum('pps->ps', _ao2mo(mf, (cc_, co2, cc_, cv_)).reshape(nc, nc, nv))
-    u2 = numpy.einsum('pps->ps', _ao2mo(mf, (cc_, cc_, co2, cv_)).reshape(nc, nc, nv))
-    # corrections for the elements that make_AS overwrites instead of accumulating
-    corr_ov2 = -t1 + t2 - f_cv[numpy.ix_(cidx, [o1])].T
-    corr_co1 = -f_cv[o2, vidx][None, :] + u1 - u2
+    # Fock-type entries of D (CO1 p=r, O2V q=s): the Fock element adds to the general term
+    corr_ov2 = (-1 if singlet else 1) * f_cv[numpy.ix_(cidx, [o1])].T
+    corr_co1 = -f_cv[o2, vidx][None, :]
 
-    s_cv = slice(3, 3 + ncv)
-    s_ov1 = slice(3 + ncv, 3 + ncv + nv)
-    s_ov2 = slice(3 + ncv + nv, 3 + ncv + 2 * nv)
-    s_co1 = slice(3 + ncv + 2 * nv, nm, 2)
-    s_co2 = slice(3 + ncv + 2 * nv + 1, nm, 2)
+    s_cv = slice(noo, noo + ncv)
+    s_ov1 = slice(noo + ncv, noo + ncv + nv)
+    s_ov2 = slice(noo + ncv + nv, noo + ncv + 2 * nv)
+    s_co1 = slice(noo + ncv + 2 * nv, nm, 2)
+    s_co2 = slice(noo + ncv + 2 * nv + 1, nm, 2)
+
+    def xcv_of(xm):
+        return xm[:, s_cv].reshape(xm.shape[0], nc, nv)
+
+    def d_triplet(xm, x, xcv, u, w, kx, ku, kw, ym):
+        '''Writes D_T x into ym and returns D_T^T xm (S1 + S2 of the SI Tables).'''
+        nvec = x.shape[0]
+        ym[:, 0] = lib.einsum('rs,nrs->n', row_lr, x)
+        ym[:, s_cv] = -(lib.einsum('pr,nrq->npq', k21_cc, x)
+                        + lib.einsum('nps,qs->npq', x, k12_vv)).reshape(nvec, -1)
+        ym[:, s_ov1] = -lib.einsum('r,nrq->nq', j12_o1c, x)
+        ym[:, s_ov2] = kx[:, o1, vidx] + lib.einsum('qr,nrq->nq', corr_ov2, x)
+        ym[:, s_co1] = kx[:, cidx, o2] + lib.einsum('ps,nps->np', corr_co1, x)
+        ym[:, s_co2] = -lib.einsum('s,nps->np', j12_o2v, x)
+        ye = (xm[:, 0, None, None] * row_lr
+              - lib.einsum('pr,npq->nrq', k21_cc, xcv) - lib.einsum('nrq,qs->nrs', xcv, k12_vv)
+              - lib.einsum('r,nq->nrq', j12_o1c, xm[:, s_ov1])
+              + ku[:, cidx][:, :, vidx]
+              + lib.einsum('qr,nq->nrq', corr_ov2, u)
+              + kw[:, cidx][:, :, vidx]
+              + lib.einsum('ps,np->nps', corr_co1, w)
+              - lib.einsum('s,np->nps', j12_o2v, xm[:, s_co2]))
+        return ye.reshape(nvec, -1)
 
     def d_parts(xm, xe):
         nvec = xe.shape[0]
@@ -230,6 +268,9 @@ def ext_hop(mf, hyb, xc_cv, a00, focka, fockb, jmo, kmo, cidx, oidx, vidx, occ_d
         kx, ku, kw = vk[:nvec], vk[nvec:2 * nvec], vk[2 * nvec:]
 
         ym = numpy.zeros_like(xm)
+        if not singlet:
+            ye = d_triplet(xm, x, xcv_of(xm), u, w, kx, ku, kw, ym)   # fills ym as well
+            return hyb * ym, hyb * ye
         ym[:, 0] = lib.einsum('rs,nrs->n', row_g, x)
         ym[:, 2] = lib.einsum('rs,nrs->n', row_lr, x)
         ym[:, s_cv] = (lib.einsum('pr,nrq->npq', k21_cc, x)
@@ -257,27 +298,34 @@ def ext_hop(mf, hyb, xc_cv, a00, focka, fockb, jmo, kmo, cidx, oidx, vidx, occ_d
         z = numpy.zeros((nvec, nc + 1, nv + 1))
         z[:, :-1, 1:] = xe.reshape(nvec, nc, nv)
         y = numpy.asarray(vind_cv(z.reshape(nvec, -1))).reshape(nvec, nc + 1, nv + 1)
-        return y[:, :-1, 1:].reshape(nvec, -1) + xe * diag_cv
+        y = y[:, :-1, 1:].reshape(nvec, -1) + xe * diag_cv
+        x = xe.reshape(nvec, nc, nv)
+        y += (lib.einsum('nia,ab->nib', x, fv_off) - lib.einsum('ij,nja->nia', fo_off, x)).reshape(nvec, -1)
+        return y
 
     return d_parts, cv_part, hd_cv
 
 
-def gen_tda_operation(mf, hyb, expansion=True, spc=True, xc_cv=None):
-    '''Return (vind, hdiag) for the MRSF (expansion=False) or EMRSF singlet matrix.'''
+def gen_tda_operation(mf, hyb, expansion=True, spc=True, xc_cv=None, singlet=True):
+    '''Return (vind, hdiag) for the MRSF (expansion=False) or EMRSF matrix, singlet or
+    triplet.'''
     _check_supported(mf, hyb)
     cidx, oidx, vidx = orb_indices(mf)
     focka, fockb = mo_fock(mf)
     jmo, kmo = _open_jk(mf, oidx)
     occ_diag = _occ_diag(mf, len(cidx) + 2)
-    mrsf_part, hd = mrsf_hop(mf, hyb, spc, focka, fockb, jmo, kmo, cidx, oidx, vidx, occ_diag)
+    mrsf_part, hd = mrsf_hop(mf, hyb, spc, focka, fockb, jmo, kmo, cidx, oidx, vidx, occ_diag,
+                             singlet)
     nm = hd.size
     if not expansion:
         def vind(xs):
             return mrsf_part(numpy.asarray(xs).reshape(-1, nm))
         return vind, hd
 
-    d_parts, cv_part, hd_cv = ext_hop(mf, hyb, xc_cv, hd[0], focka, fockb, jmo, kmo,
-                                      cidx, oidx, vidx, occ_diag)
+    o1, o2 = oidx
+    a00 = fockb[o1, o1] - focka[o2, o2] - hyb * jmo[1, 1][o1, o1]
+    d_parts, cv_part, hd_cv = ext_hop(mf, hyb, xc_cv, a00, focka, fockb, jmo, kmo,
+                                      cidx, oidx, vidx, occ_diag, singlet)
 
     def vind(xs):
         xs = numpy.asarray(xs).reshape(-1, nm + hd_cv.size)

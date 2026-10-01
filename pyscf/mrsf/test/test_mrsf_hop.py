@@ -18,7 +18,6 @@
 '''Tests of the matrix-free EMRSF operator against the stage-2 dense matrix.'''
 
 import io
-import os
 import sys
 import unittest
 import numpy
