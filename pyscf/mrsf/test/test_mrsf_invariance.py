@@ -84,6 +84,46 @@ class KnownValues(unittest.TestCase):
                                        delta=1e-10, msg=singlet)
                 self.assertEqual(hdiag.size, a.shape[0])
 
+def shuffled(mf):
+    """Same reference with the MO columns out of aufbau order (as after MOM): the open
+    orbitals last, a virtual orbital first."""
+    occ = numpy.asarray(mf.mo_occ)
+    core, opn, vir = [numpy.where(occ == k)[0] for k in (2, 1, 0)]
+    perm = numpy.concatenate((vir[:1], core[::-1], vir[1:], opn))
+    mf2 = mf.copy()
+    mf2.mo_coeff = mf.mo_coeff[:, perm]
+    mf2.mo_occ = occ[perm]
+    mf2.mo_energy = numpy.asarray(mf.mo_energy)[perm]
+    return mf2, perm
+
+
+class KnownValues_Order(unittest.TestCase):
+    def test_unordered_occupations(self):
+        mf2, perm = shuffled(mf_gga)
+        hyb = rohf_mrsf.hybrid_coeff(mf_gga)
+        for singlet in (True, False):
+            e0 = numpy.linalg.eigvalsh(rohf_mrsf.build_matrix(mf_gga, hyb, singlet=singlet))[:6]
+            e1 = numpy.linalg.eigvalsh(rohf_mrsf.build_matrix(mf2, hyb, singlet=singlet))[:6]
+            self.assertAlmostEqual(abs(e0 - e1).max(), 0, delta=1e-10)
+            for dense_threshold in (200, 0):
+                tds = []
+                for m in (mf_gga, mf2):
+                    td = mrsf.TDA_EMRSF(m)
+                    td.singlet = singlet
+                    td.nstates = 4
+                    td.dense_threshold = dense_threshold
+                    td.kernel()
+                    tds.append(td)
+                self.assertAlmostEqual(abs(tds[0].e - tds[1].e).max(), 0, delta=1e-8)
+                self.assertAlmostEqual(abs(tds[0].oscillator_strength() - tds[1].oscillator_strength()).max(), 0,
+                                       delta=1e-6)
+                # trans_rdm1 stays in the MO order of the given reference (up to the sign of the states)
+                t0, t1 = tds[0].trans_rdm1(0, 1), tds[1].trans_rdm1(0, 1)
+                a0 = mf_gga.mo_coeff.dot(t0).dot(mf_gga.mo_coeff.T)
+                a1 = mf2.mo_coeff.dot(t1).dot(mf2.mo_coeff.T)
+                self.assertAlmostEqual(min(abs(a0 - a1).max(), abs(a0 + a1).max()), 0, delta=1e-6)
+        self.assertTrue(numpy.array_equal(mf2.mo_occ, numpy.asarray(mf_gga.mo_occ)[perm]))
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -49,6 +49,27 @@ def orb_indices(mf):
     return (numpy.arange(nc), numpy.arange(nc, nc + 2), numpy.arange(nc + 2, occ.size))
 
 
+def ordered_scf(mf):
+    '''(mf, None) if mo_occ is ordered as core, open, virtual. Otherwise (e.g. after MOM)
+    a copy of mf with the MOs reordered that way, keeping their order within each group,
+    and the permutation perm with copy.mo_coeff = mf.mo_coeff[:, perm]. MRSF and EMRSF
+    depend only on the three subspaces, so the results are unchanged.'''
+    if mf.mo_occ is None:
+        raise ValueError('run the SCF first')
+    occ = numpy.asarray(mf.mo_occ)
+    if occ.ndim != 1 or not numpy.any(numpy.diff(occ) > 0):
+        return mf, None
+    perm = numpy.concatenate([numpy.where(occ == k)[0] for k in (2, 1, 0)])
+    if perm.size != occ.size:
+        return mf, None     # fractional occupations: orb_indices reports them
+    mf1 = mf.copy()
+    mf1.mo_coeff = numpy.asarray(mf.mo_coeff)[:, perm]
+    mf1.mo_occ = occ[perm]
+    if mf.mo_energy is not None:
+        mf1.mo_energy = numpy.asarray(mf.mo_energy)[perm]
+    return mf1, perm
+
+
 def pairs(a, b):
     return numpy.array([(p, q) for p in a for q in b], dtype=int).reshape(-1, 2)
 
@@ -291,6 +312,7 @@ def g_energy(focka, fockb, eri, hyb, oidx):
 
 
 def build_matrix(mf, hyb, expansion=True, spc=True, xc_cv=None, singlet=True):
+    mf = ordered_scf(mf)[0]
     cidx, oidx, vidx = orb_indices(mf)
     focka, fockb = mo_fock(mf)
     eri = mo_eri(mf)
@@ -430,7 +452,10 @@ def analyze(tdobj, verbose=None):
     log = logger.new_logger(tdobj, verbose)
     if tdobj.xy is None:
         tdobj.kernel()
-    cidx, oidx, vidx = orb_indices(tdobj._scf)
+    mf, perm = ordered_scf(tdobj._scf)
+    cidx, oidx, vidx = orb_indices(mf)
+    if perm is not None:    # label with the MO numbers of the given reference
+        cidx, oidx, vidx = perm[cidx], perm[oidx], perm[vidx]
     labels = basis_labels(cidx, oidx, vidx, tdobj.expansion, tdobj.singlet)
     kinds = numpy.array([k for k, _ in labels])
     blocks = ['G', 'D', 'L-R', 'L+R', 'CV', 'OV', 'CO', 'CV_ext']
@@ -517,7 +542,7 @@ class TDA_MRSF(TDBase):
         lib.StreamObject.check_sanity(self)
         if self.frozen is not None or self.wfnsym is not None:
             raise NotImplementedError('MRSF/EMRSF does not support frozen orbitals or wfnsym')
-        orb_indices(self._scf)
+        orb_indices(ordered_scf(self._scf)[0])
         if not self._scf.converged:
             logger.warn(self, 'Reference SCF is not converged')
         return self
@@ -551,7 +576,7 @@ class TDA_MRSF(TDBase):
 
     @property
     def dim(self):
-        cidx, oidx, vidx = orb_indices(self._scf)
+        cidx, oidx, vidx = orb_indices(ordered_scf(self._scf)[0])
         nc, nv = len(cidx), len(vidx)
         # singlet: G, D, L-R from the four open-open pairs; triplet: L+R only
         n = (nc + 2) * (nv + 2) - (1 if self.singlet else 3)
@@ -648,12 +673,17 @@ class TDA_MRSF(TDBase):
         '''MO-basis transition density T[p,q] = <i|a+_p a_q|j> (spin-summed) between
         states i and j.'''
         self._check_transition_properties()
-        cidx, oidx, vidx = orb_indices(self._scf)
-        nmo = self._scf.mo_coeff.shape[1]
+        mf, perm = ordered_scf(self._scf)
+        cidx, oidx, vidx = orb_indices(mf)
+        nmo = mf.mo_coeff.shape[1]
         xi, xj = self.xy[i][0], self.xy[j][0]
         t = trans_rdm1_mrsf(xi, xj, cidx, oidx, vidx, nmo, self.singlet)
         if self.expansion:
             t += trans_rdm1_ext(xi, xj, cidx, oidx, vidx, nmo, self.singlet)
+        if perm is not None:    # back to the MO order of the given reference
+            t1 = numpy.empty_like(t)
+            t1[numpy.ix_(perm, perm)] = t
+            t = t1
         return t
 
     def transition_dipole(self):

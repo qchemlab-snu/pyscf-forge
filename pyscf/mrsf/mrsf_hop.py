@@ -26,7 +26,7 @@ proxy, and the remaining couplings are built from AO J/K contractions.
 import numpy
 from pyscf import lib, ao2mo, tdscf
 from pyscf.dft.rks import KohnShamDFT
-from pyscf.mrsf.rohf_mrsf import SQRT2, orb_indices, pairs, mo_fock, cv_proxy
+from pyscf.mrsf.rohf_mrsf import SQRT2, orb_indices, ordered_scf, pairs, mo_fock, cv_proxy
 
 
 def _check_supported(mf, hyb):
@@ -310,6 +310,7 @@ def gen_tda_operation(mf, hyb, expansion=True, spc=True, xc_cv=None, singlet=Tru
     '''Return (vind, hdiag) for the MRSF (expansion=False) or EMRSF matrix, singlet or
     triplet.'''
     _check_supported(mf, hyb)
+    mf = ordered_scf(mf)[0]
     cidx, oidx, vidx = orb_indices(mf)
     focka, fockb = mo_fock(mf)
     jmo, kmo = _open_jk(mf, oidx)
