@@ -14,6 +14,7 @@
 # limitations under the License.
 #
 # Author: Minseok Oh <msjeff2001@snu.ac.kr>
+#         Nakhyun Kim <kimnh97@snu.ac.kr>
 #
 '''
 Matrix-free A x for the MRSF / EMRSF singlet TDA.
