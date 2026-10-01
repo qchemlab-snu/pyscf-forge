@@ -14,6 +14,7 @@
 # limitations under the License.
 #
 # Author: Minseok Oh <msjeff2001@snu.ac.kr>
+#         Nakhyun Kim <kimnh97@snu.ac.kr>
 #
 '''
 Mixed-reference spin-flip (MRSF) and extended MRSF (EMRSF) TDA for a triplet
