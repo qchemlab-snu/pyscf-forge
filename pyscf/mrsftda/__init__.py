@@ -15,5 +15,5 @@
 
 '''Mixed-reference spin-flip (MRSF) and extended MRSF (EMRSF) TDA'''
 
-from pyscf.mrsf import rohf_mrsf
-from pyscf.mrsf.rohf_mrsf import TDA_MRSF
+from pyscf.mrsftda import rohf_mrsf
+from pyscf.mrsftda.rohf_mrsf import TDA_MRSF
