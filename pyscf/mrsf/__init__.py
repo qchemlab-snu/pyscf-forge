@@ -12,24 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# Author: Minseok Oh <msjeff2001@snu.ac.kr>
-#
-'''
-Mixed-reference spin-flip (MRSF) and extended MRSF (EMRSF) TDA.
 
-    from pyscf import mrsf
-    td = mrsf.TDA_EMRSF(mf)     # mf: converged triplet ROHF/ROKS
-    td.kernel()
-'''
+'''Mixed-reference spin-flip (MRSF) and extended MRSF (EMRSF) TDA'''
 
 from pyscf.mrsf import rohf_mrsf
-from pyscf.mrsf.rohf_mrsf import get_ab_mrsf, get_ab
-
-
-def TDA_MRSF(mf):
-    return mf.remove_soscf().TDA_MRSF()
-
-
-def TDA_EMRSF(mf):
-    return mf.remove_soscf().TDA_EMRSF()
+from pyscf.mrsf.rohf_mrsf import TDA_MRSF

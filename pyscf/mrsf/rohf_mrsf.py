@@ -375,7 +375,7 @@ def gen_ext_vind(mf, hyb, cv, a00, focka, fockb, jmo, kmo, cidx, oidx, vidx, occ
     dsh = jmo[0, 0].diagonal() - jmo[1, 1].diagonal()
     sh_ia = (dsh[vidx][None, :] - dsh[cidx][:, None]).ravel()
     diag_cv = a00 - (1 - hyb_cv) * sh_ia
-    # off-diagonal F' = F_cv + (1-hyb)[(pq|O2O2) - (pq|O1O1)] 
+    # off-diagonal F' = F_cv + (1-hyb)[(pq|O2O2) - (pq|O1O1)]
     fcv = f_cv + (1 - hyb_cv) * (jmo[1, 1] - jmo[0, 0])
     fo_off = fcv[numpy.ix_(cidx, cidx)].copy()
     fv_off = fcv[numpy.ix_(vidx, vidx)].copy()
