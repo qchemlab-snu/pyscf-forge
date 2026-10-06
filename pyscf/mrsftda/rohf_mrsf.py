@@ -23,9 +23,9 @@ the closed-shell singlet reference (O1 doubly occupied) to the MRSF response spa
 
 The SCF object supplies the integrals (hcore, J/K, XC), so molecules and Gamma-point PBC
 cells are both supported. The response space is spanned by mo_coeff (default: all
-orbitals of mf); doubly occupied orbitals in mo_core are frozen and enter only through
-the reference density (embedding). Integrals already in the MO basis of the response
-orbitals can also be given directly (TDA_MRSF.given_mo_ints).
+orbitals of mf) minus the frozen orbitals; frozen doubly occupied orbitals enter only
+through the reference density (embedding). Integrals already in the MO basis of the
+response orbitals can also be given directly (TDA_MRSF.given_mo_ints).
 
 Refs:
     S. Lee, M. Filatov, S. Lee and C. H. Choi, J. Chem. Phys. 149, 104101 (2018)
@@ -44,19 +44,15 @@ SQRT2 = numpy.sqrt(2.)
 MO_BASE = getattr(__config__, 'MO_BASE', 1)
 
 
-def order_orbitals(mo_coeff, mo_occ):
-    '''Orbitals reordered as doubly occupied, singly occupied, empty, keeping the order
-    within each group (e.g. after MOM). Returns (mo_coeff, mo_occ, perm), perm None if the
-    order is unchanged.'''
+def response_orbitals(mo_occ, mask):
+    '''Positions of the response orbitals (mask True) ordered as doubly occupied, singly
+    occupied, empty, keeping the input order within each group (e.g. after MOM).'''
     occ = numpy.asarray(mo_occ, dtype=float)
     if occ.ndim != 1:
         raise ValueError('MRSF needs a restricted open-shell (ROHF/ROKS) reference')
-    perm = numpy.concatenate([numpy.where(occ == k)[0] for k in (2, 1, 0)])
-    if perm.size != occ.size:
+    if not numpy.all((occ == 2) | (occ == 1) | (occ == 0)):
         raise ValueError('mo_occ must contain only 2, 1 and 0')
-    if numpy.all(perm == numpy.arange(occ.size)):
-        return numpy.asarray(mo_coeff), occ, None
-    return numpy.asarray(mo_coeff)[:, perm], occ[perm], perm
+    return numpy.concatenate([numpy.where(mask & (occ == k))[0] for k in (2, 1, 0)])
 
 
 def hybrid_coeff(mf):
@@ -621,11 +617,10 @@ def analyze(tdobj, verbose=None):
     log = logger.new_logger(tdobj, verbose)
     if tdobj.xy is None:
         tdobj.kernel()
-    cidx, oidx, vidx = orb_indices(tdobj.mo_occ)
-    perm = tdobj._perm
-    if perm is not None:    # label with the orbital numbers of the input
-        cidx, oidx, vidx = perm[cidx], perm[oidx], perm[vidx]
-    labels = basis_labels(cidx, oidx, vidx, tdobj.extended, tdobj.singlet)
+    idx = tdobj.response_space()[1]
+    cidx, oidx, vidx = orb_indices(tdobj.mo_occ[idx])
+    # label with the orbital numbers of the input mo_coeff
+    labels = basis_labels(idx[cidx], idx[oidx], idx[vidx], tdobj.extended, tdobj.singlet)
     kinds = numpy.array([k for k, _ in labels])
     blocks = ['G', 'D', 'L-R', 'L+R', 'CV', 'OV', 'CO', 'CV_ext']
     e0 = tdobj.e[0]
@@ -648,13 +643,19 @@ class TDA_MRSF(TDBase):
     Args:
         mf : SCF object (molecule or Gamma-point PBC cell) providing the AO integrals and,
             for Kohn-Sham, the functional and grids; or mf_given_mo_ints (given_mo_ints).
-        mo_coeff, mo_occ : orbitals spanning the response space and their occupations
-            2, 1, 0 with exactly two singly occupied (default mf.mo_coeff, mf.mo_occ),
-            reordered as doubly occupied, singly occupied, empty if needed.
-        mo_core : (nao, ncore) frozen doubly occupied orbitals (embedding), or None.
+        mo_coeff, mo_occ : orbitals (canonical, localized, ...), as many as in mf, and
+            their occupations 2, 1, 0 with exactly two singly occupied (default
+            mf.mo_coeff, mf.mo_occ), in any order (e.g. after MOM). The first singly
+            occupied orbital is O1, doubly occupied in the closed-shell reference of the
+            EMRSF CV block.
+        frozen : int or list
+            Orbitals of mo_coeff left out of the response, as in pyscf.tdscf (int: the
+            first ones). Frozen doubly occupied orbitals stay in the reference density
+            (embedding); frozen empty orbitals are dropped.
         extended : EMRSF if True.
-        fock : (focka, fockb) in the mo_coeff basis, replacing those computed from mf.
-        fock_cv : closed-shell proxy Fock matrix of the EMRSF CV block, mo_coeff basis.
+        fock : (focka, fockb) in the basis of the unfrozen orbitals (order of mo_coeff),
+            replacing those computed from mf.
+        fock_cv : closed-shell proxy Fock matrix of the EMRSF CV block, same basis.
 
     Attributes:
         spc : bool
@@ -681,16 +682,14 @@ class TDA_MRSF(TDBase):
     # extra roots solved by Davidson and discarded, so that no low state is missed
     nroots_extra = 3
 
-    _keys = {'mo_coeff', 'mo_occ', 'mo_core', 'fock', 'fock_cv', 'extended', 'spc',
+    _keys = {'mo_coeff', 'mo_occ', 'fock', 'fock_cv', 'extended', 'spc',
              'with_df', 'dense_threshold', 'nroots_extra', 'max_space', 'e_ref'}
 
-    def __init__(self, mf, mo_coeff=None, mo_occ=None, mo_core=None, extended=None,
+    def __init__(self, mf, mo_coeff=None, mo_occ=None, frozen=None, extended=None,
                  fock=None, fock_cv=None):
-        TDBase.__init__(self, mf)
-        self.mo_coeff, self.mo_occ, self._perm = order_orbitals(
-            mf.mo_coeff if mo_coeff is None else mo_coeff,
-            mf.mo_occ if mo_occ is None else mo_occ)
-        self.mo_core = None if mo_core is None else numpy.asarray(mo_core)
+        TDBase.__init__(self, mf, frozen)
+        self.mo_coeff = numpy.asarray(mf.mo_coeff if mo_coeff is None else mo_coeff)
+        self.mo_occ = numpy.asarray(mf.mo_occ if mo_occ is None else mo_occ, dtype=float)
         self.fock = fock
         self.fock_cv = fock_cv
         if extended is not None:
@@ -726,20 +725,31 @@ class TDA_MRSF(TDBase):
         '''Fraction of exact exchange of mf.xc (1 for HF), or the hyb of given_mo_ints.'''
         return self._hyb if self._hyb is not None else hybrid_coeff(self._scf)
 
+    def response_space(self):
+        '''(mo_core, idx, order): frozen doubly occupied orbitals, the positions in mo_coeff
+        of the response orbitals ordered as doubly occupied, open, empty, and their
+        positions among the unfrozen orbitals (the basis of fock and fock_cv).'''
+        mask = self.get_frozen_mask()
+        idx = response_orbitals(self.mo_occ, mask)
+        mo_core = self.mo_coeff[:, ~mask & (self.mo_occ == 2)]
+        return mo_core, idx, numpy.searchsorted(numpy.where(mask)[0], idx)
+
     @property
     def dim(self):
-        occ = self.mo_occ
+        occ = self.mo_occ[self.get_frozen_mask()]
         nc, nv = numpy.count_nonzero(occ == 2), numpy.count_nonzero(occ == 0)
         n = (nc + 2) * (nv + 2) - (1 if self.singlet else 3)
         return n + nc * nv if self.extended else n
 
     def dump_flags(self, verbose=None):
         log = logger.new_logger(self, verbose)
-        occ = self.mo_occ
+        mask = self.get_frozen_mask()
+        occ = self.mo_occ[mask]
         log.info('\n** %s (%s) **', self.method_name, self.__class__.__name__)
-        log.info('response orbitals: %d (doubly occupied %d, open 2, empty %d); frozen core: %d',
-                 occ.size, numpy.count_nonzero(occ == 2), numpy.count_nonzero(occ == 0),
-                 0 if self.mo_core is None else self.mo_core.shape[1])
+        log.info('response orbitals: %d (doubly occupied %d, open 2, empty %d); '
+                 'frozen: %d doubly occupied, %d empty', occ.size, numpy.count_nonzero(occ == 2),
+                 numpy.count_nonzero(occ == 0), numpy.count_nonzero(self.mo_occ[~mask] == 2),
+                 numpy.count_nonzero(self.mo_occ[~mask] == 0))
         log.info('singlet = %s, spin-pairing coupling = %s, with_df = %s',
                  self.singlet, self.spc, self.with_df)
         log.info('hyb = %g, nstates = %d, conv_tol = %g', self.get_hyb(), self.nstates, self.conv_tol)
@@ -747,14 +757,20 @@ class TDA_MRSF(TDBase):
 
     def check_sanity(self):
         lib.StreamObject.check_sanity(self)
-        if self.frozen is not None or self.wfnsym is not None:
-            raise NotImplementedError('use mo_coeff / mo_core to choose the response space')
+        if self.wfnsym is not None:
+            raise NotImplementedError('wfnsym is not supported')
         occ = self.mo_occ
-        n = occ.size
-        if self.mo_coeff.ndim != 2 or self.mo_coeff.shape[1] != n:
+        if self.mo_coeff.ndim != 2 or self.mo_coeff.shape[1] != occ.size:
             raise ValueError('mo_coeff must be (nao, n) with n = len(mo_occ)')
+        if occ.size != numpy.size(self._scf.mo_occ):
+            raise ValueError('mo_coeff must have as many orbitals as mf.mo_coeff; '
+                             'use frozen to leave orbitals out')
+        idx = self.response_space()[1]
+        n = idx.size
         if numpy.count_nonzero(occ == 1) != 2:
             raise ValueError('MRSF needs exactly two singly occupied orbitals')
+        if numpy.count_nonzero(occ[idx] == 1) != 2:
+            raise ValueError('the singly occupied orbitals cannot be frozen')
         if self._scf.mol.spin != 2:
             raise ValueError('MRSF needs a triplet (spin = 2) reference')
         if self.fock is not None and numpy.shape(self.fock) != (2, n, n):
@@ -763,17 +779,20 @@ class TDA_MRSF(TDBase):
             raise ValueError('fock_cv must be (n, n)')
         if self.with_df and self._scf.mol.natm == 0:
             raise ValueError('with_df needs an atomic basis (not available with given_mo_ints)')
-        s = self._scf.get_ovlp()
-        c = self.mo_coeff if self.mo_core is None else numpy.hstack((self.mo_core, self.mo_coeff))
-        err = abs(c.T.dot(s).dot(c) - numpy.eye(c.shape[1])).max()
+        c = self.mo_coeff
+        err = abs(c.T.dot(self._scf.get_ovlp()).dot(c) - numpy.eye(c.shape[1])).max()
         if err > 1e-6:
-            logger.warn(self, 'mo_core + mo_coeff are not orthonormal (max error %.2e)', err)
+            logger.warn(self, 'mo_coeff is not orthonormal (max error %.2e)', err)
         return self
 
     def gen_vind(self, mf=None):
+        mo_core, idx, order = self.response_space()
+        oo = numpy.ix_(order, order)
+        fock = None if self.fock is None else [numpy.asarray(f)[oo] for f in self.fock]
+        fock_cv = None if self.fock_cv is None else numpy.asarray(self.fock_cv)[oo]
         vind, hdiag, self.e_ref = gen_tda_operation(
-            self._scf, self.mo_coeff, self.mo_occ, self.mo_core, self.get_hyb(), self.extended,
-            self.spc, self.singlet, self.fock, self.fock_cv, self.with_df)
+            self._scf, self.mo_coeff[:, idx], self.mo_occ[idx], mo_core, self.get_hyb(),
+            self.extended, self.spc, self.singlet, fock, fock_cv, self.with_df)
         if self._e_ref is not None:
             self.e_ref = self._e_ref
         return vind, hdiag
@@ -842,20 +861,19 @@ class TDA_MRSF(TDBase):
 
     def trans_rdm1(self, i, j):
         '''Transition density T[p,q] = <i|a+_p a_q|j> (spin-summed) between states i and j
-        in the basis of mo_coeff, given in the orbital order of the input.'''
+        in the basis of mo_coeff (zero for the frozen orbitals).'''
         if self.xy is None:
             self.kernel()
-        cidx, oidx, vidx = orb_indices(self.mo_occ)
-        n = self.mo_occ.size
+        idx = self.response_space()[1]
+        cidx, oidx, vidx = orb_indices(self.mo_occ[idx])
+        n = idx.size
         xi, xj = self.xy[i][0], self.xy[j][0]
         t = trans_rdm1_mrsf(xi, xj, cidx, oidx, vidx, n, self.singlet)
         if self.extended:
             t += trans_rdm1_ext(xi, xj, cidx, oidx, vidx, n, self.singlet)
-        if self._perm is not None:
-            t1 = numpy.empty_like(t)
-            t1[numpy.ix_(self._perm, self._perm)] = t
-            t = t1
-        return t
+        t1 = numpy.zeros((self.mo_occ.size,) * 2)
+        t1[numpy.ix_(idx, idx)] = t
+        return t1
 
     def transition_dipole(self):
         '''Transition dipoles (a.u., origin at the center of mass) from the lowest state to
@@ -869,7 +887,7 @@ class TDA_MRSF(TDBase):
         com = numpy.einsum('i,ix->x', mass, mol.atom_coords()) / mass.sum()
         with mol.with_common_orig(com):
             ints = mol.intor_symmetric('int1e_r', comp=3)
-        c = self.mo_coeff if self._perm is None else self.mo_coeff[:, numpy.argsort(self._perm)]
+        c = self.mo_coeff
         dip = [-numpy.einsum('xpq,pq->x', ints, c.dot(self.trans_rdm1(0, i)).dot(c.T))
                for i in range(1, len(self.xy))]
         return numpy.array(dip).reshape(-1, 3)
