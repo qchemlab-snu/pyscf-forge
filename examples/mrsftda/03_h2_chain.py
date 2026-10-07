@@ -4,15 +4,19 @@
 Embedded MRSF / EMRSF for a periodic H2 chain (Gamma point).
 
 Five H2 units per cell; the bond of the central unit is stretched. The cell's SCF
-object supplies the AO integrals (density fitted), and the response space is a window
-of 6 orbitals (2 doubly occupied, O1, O2, 2 virtual) around the open shells. Lower
-orbitals are frozen core (they enter only through the reference density), higher ones
-frozen virtuals. Localized orbitals, e.g. from AVAS, can be given as mo_coeff and
-frozen the same way.
+object supplies the AO integrals (density fitted). The response space is the AVAS
+active space of the three central units (H 1s): here 6 orbitals with 6 electrons
+(2 doubly occupied, O1, O2, 2 virtual). AVAS rotates only within the doubly occupied
+and the empty orbitals (canonicalize=False) and keeps the singly occupied ones
+(openshell_option=3), so its orbitals describe the same determinant as mf, ordered as
+core | active | virtual with the occupations mf.mo_occ. The core and virtual orbitals
+are frozen: doubly occupied ones enter only through the reference density, empty ones
+are dropped.
 '''
 
 import numpy
 from pyscf.pbc import gto, scf, df
+from pyscf.mcscf import avas
 from pyscf import mrsftda
 from pyscf.data.nist import HARTREE2EV
 
@@ -38,11 +42,14 @@ mf.with_df = df.GDF(cell)
 mf.exxdiv = None
 mf.kernel()
 
-ncore = int(numpy.count_nonzero(mf.mo_occ == 2)) - 2     # 2 doubly occupied orbitals active
-nact = 6
-frozen = list(range(ncore)) + list(range(ncore + nact, mf.mo_occ.size))
+labels = ['2 H 1s', '3 H 1s', '4 H 1s', '5 H 1s', '6 H 1s', '7 H 1s']
+ncas, nelecas, mo = avas.AVAS(mf, labels, threshold=0.1, openshell_option=3,
+                              minao=cell.basis, canonicalize=False, with_iao=True).kernel()
+ncore = (cell.nelectron - nelecas) // 2
+frozen = list(range(ncore)) + list(range(ncore + ncas, mo.shape[1]))
 for extended in (False, True):
-    td = mrsftda.TDA_MRSF(mf, frozen=frozen, extended=extended)
+    td = mrsftda.TDA_MRSF(mf, mo_coeff=mo, mo_occ=mf.mo_occ, frozen=frozen,
+                          extended=extended)
     td.kernel(nstates=5)
     print(f'\n{"EMRSF" if extended else "MRSF"} singlets, H2 chain (central bond {R:.2f} A)')
     print(f'  reference (triplet ROHF) {td.e_ref:14.8f} Eh')
