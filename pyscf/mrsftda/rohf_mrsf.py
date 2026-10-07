@@ -176,6 +176,31 @@ def _occ_diag_jk(mf, nocc):
     return jdiag, kdiag
 
 
+def _ao2mo(mf, mos):
+    shape = [m.shape[1] for m in mos]
+    if getattr(mf, 'with_df', None) is not None:
+        eri = mf.with_df.ao2mo(mos, compact=False)
+    elif getattr(mf, '_eri', None) is not None:
+        eri = ao2mo.general(mf._eri, mos, compact=False)
+    else:
+        eri = ao2mo.outcore.general_iofree(mf.mol, mos, compact=False, max_memory=mf.max_memory)
+    return numpy.asarray(eri).real.reshape(shape)
+
+
+def d_integrals(mf, cidx, oidx, vidx):
+    '''The MO integrals the EMRSF D coupling needs, (O1 a|c b), (O1 c|a b), (c' O2|c b)
+    and (c' c|O2 b), as arrays [a, c, b], [a, c, b], [c', c, b] and [c', c, b].'''
+    c = mf.mo_coeff
+    cc, cv = c[:, cidx], c[:, vidx]
+    co1, co2 = c[:, oidx[:1]], c[:, oidx[1:]]
+    nc, nv = cc.shape[1], cv.shape[1]
+    t_a = _ao2mo(mf, (co1, cv, cc, cv)).reshape(nv, nc, nv)
+    t_b = numpy.ascontiguousarray(_ao2mo(mf, (co1, cc, cv, cv)).reshape(nc, nv, nv).transpose(1, 0, 2))
+    t_c = _ao2mo(mf, (cc, co2, cc, cv)).reshape(nc, nc, nv)
+    t_d = _ao2mo(mf, (cc, cc, co2, cv)).reshape(nc, nc, nv)
+    return t_a, t_b, t_c, t_d
+
+
 def spin_pair_block(kmo, hyb, cidx, oidx, vidx):
     '''Spin-pairing coupling (Slater-Condon) in the CV + OV + CO basis from open-open K.'''
     nc, nv = len(cidx), len(vidx)
@@ -350,10 +375,14 @@ def cv_proxy(mf, mo_coeff, mo_occ, mo_core=None, fock_cv=None):
 
 
 def gen_ext_vind(mf, hyb, cv, a00, focka, fockb, jmo, kmo, cidx, oidx, vidx, occ_diag=None,
-                 singlet=True):
+                 singlet=True, d_mo=None):
     '''EMRSF extension: CV block (pyscf TDA on the closed-shell proxy, whose frozen-core rows
-    carry no amplitude) and the D coupling to the MRSF space, from batched AO J/K.
-    cv = cv_proxy(...).'''
+    carry no amplitude) and the D coupling to the MRSF space. cv = cv_proxy(...).
+
+    The D coupling only needs the O1 and O2 rows of J/K of the core->virtual densities.
+    With d_mo (default: when the integrals fit in max_memory) it uses the four MO
+    integral sets of d_integrals, computed once, so a matvec costs O(nc nv^2) instead of
+    an AO J/K build of 3 densities per vector.'''
     o1, o2 = oidx
     nc, nv = len(cidx), len(vidx)
     ncv = nc * nv
@@ -398,6 +427,12 @@ def gen_ext_vind(mf, hyb, cv, a00, focka, fockb, jmo, kmo, cidx, oidx, vidx, occ
     corr_ov2 = (-1 if singlet else 1) * f_cv[numpy.ix_(cidx, [o1])].T
     corr_co1 = -f_cv[o2, vidx][None, :]
 
+    if d_mo is None:
+        mem = 8e-6 * (2 * nv * nv * nc + 2 * nc * nc * nv)
+        d_mo = mem < .5 * (mf.max_memory - lib.current_memory()[0])
+    if d_mo:
+        t_a, t_b, t_c, t_d = d_integrals(mf, cidx, oidx, vidx)
+
     s_cv = slice(noo, noo + ncv)
     s_ov1 = slice(noo + ncv, noo + ncv + nv)
     s_ov2 = slice(noo + ncv + nv, noo + ncv + 2 * nv)
@@ -407,62 +442,81 @@ def gen_ext_vind(mf, hyb, cv, a00, focka, fockb, jmo, kmo, cidx, oidx, vidx, occ
     def xcv_of(xm):
         return xm[:, s_cv].reshape(xm.shape[0], nc, nv)
 
-    def d_triplet(xm, x, xcv, u, w, kx, ku, kw, ym):
+    def d_triplet(xm, x, xcv, u, w, jkx, jku, jkw, ym):
         '''Writes D_T x into ym and returns D_T^T xm (S1 + S2 of the SI Tables).'''
         nvec = x.shape[0]
         ym[:, 0] = lib.einsum('rs,nrs->n', row_lr, x)
         ym[:, s_cv] = -(lib.einsum('pr,nrq->npq', k21_cc, x)
                         + lib.einsum('nps,qs->npq', x, k12_vv)).reshape(nvec, -1)
         ym[:, s_ov1] = -lib.einsum('r,nrq->nq', j12_o1c, x)
-        ym[:, s_ov2] = kx[:, o1, vidx] + lib.einsum('qr,nrq->nq', corr_ov2, x)
-        ym[:, s_co1] = kx[:, cidx, o2] + lib.einsum('ps,nps->np', corr_co1, x)
+        ym[:, s_ov2] = jkx[1] + lib.einsum('qr,nrq->nq', corr_ov2, x)
+        ym[:, s_co1] = jkx[3] + lib.einsum('ps,nps->np', corr_co1, x)
         ym[:, s_co2] = -lib.einsum('s,nps->np', j12_o2v, x)
         ye = (xm[:, 0, None, None] * row_lr
               - lib.einsum('pr,npq->nrq', k21_cc, xcv) - lib.einsum('nrq,qs->nrs', xcv, k12_vv)
               - lib.einsum('r,nq->nrq', j12_o1c, xm[:, s_ov1])
-              + ku[:, cidx][:, :, vidx]
+              + jku[1]
               + lib.einsum('qr,nq->nrq', corr_ov2, u)
-              + kw[:, cidx][:, :, vidx]
+              + jkw[1]
               + lib.einsum('ps,np->nps', corr_co1, w)
               - lib.einsum('s,np->nps', j12_o2v, xm[:, s_co2]))
         return ye.reshape(nvec, -1)
+
+    def jk_pieces(x, u, w):
+        '''J and K of the densities x (c->v), u (O1->v) and w (c->O2), at the elements
+        D needs: (J, K)[x] at (O1, v) and (c, O2), (J, K)[u] and (J, K)[w] at (c, v).'''
+        if d_mo:
+            jx_o1v = lib.einsum('acb,ncb->na', t_a, x)
+            kx_o1v = lib.einsum('acb,ncb->na', t_b, x)
+            jx_co2 = lib.einsum('dcb,ncb->nd', t_c, x)
+            kx_co2 = lib.einsum('dcb,ncb->nd', t_d, x)
+            ju = lib.einsum('vcb,nv->ncb', t_a, u)
+            ku = lib.einsum('bcv,nv->ncb', t_b, u)
+            jw = lib.einsum('cdb,nc->ndb', t_c, w)
+            kw = lib.einsum('dcb,nc->ndb', t_d, w)
+        else:
+            nvec = x.shape[0]
+            dm_x = lib.einsum('pr,nrs,qs->npq', cc_, x, cv_)
+            dm_u = lib.einsum('p,nq->npq', co1[:, 0], u.dot(cv_.T))
+            dm_w = lib.einsum('np,q->npq', w.dot(cc_.T), co2[:, 0])
+            vj, vk = mf.get_jk(mf.mol, numpy.concatenate((dm_x, dm_u, dm_w)), hermi=0)
+            vj = lib.einsum('npq,pi,qj->nij', vj, c, c)
+            vk = lib.einsum('npq,pi,qj->nij', vk, c, c)
+            jx_o1v, kx_o1v = vj[:nvec, o1][:, vidx], vk[:nvec, o1][:, vidx]
+            jx_co2, kx_co2 = vj[:nvec][:, cidx, o2], vk[:nvec][:, cidx, o2]
+            ju = vj[nvec:2 * nvec][:, cidx][:, :, vidx]
+            ku = vk[nvec:2 * nvec][:, cidx][:, :, vidx]
+            jw = vj[2 * nvec:][:, cidx][:, :, vidx]
+            kw = vk[2 * nvec:][:, cidx][:, :, vidx]
+        return (jx_o1v, kx_o1v, jx_co2, kx_co2), (ju, ku), (jw, kw)
 
     def vind_d(xm, xe):
         nvec = xe.shape[0]
         x = xe.reshape(nvec, nc, nv)
         u = xm[:, s_ov2]
         w = xm[:, s_co1]
-        dm_x = lib.einsum('pr,nrs,qs->npq', cc_, x, cv_)
-        dm_u = lib.einsum('p,nq->npq', co1[:, 0], u.dot(cv_.T))
-        dm_w = lib.einsum('np,q->npq', w.dot(cc_.T), co2[:, 0])
-        vj, vk = mf.get_jk(mf.mol, numpy.concatenate((dm_x, dm_u, dm_w)), hermi=0)
-        vj = lib.einsum('npq,pi,qj->nij', vj, c, c)
-        vk = lib.einsum('npq,pi,qj->nij', vk, c, c)
-        jx, ju, jw = vj[:nvec], vj[nvec:2 * nvec], vj[2 * nvec:]
-        kx, ku, kw = vk[:nvec], vk[nvec:2 * nvec], vk[2 * nvec:]
+        jkx, jku, jkw = jk_pieces(x, u, w)
 
         ym = numpy.zeros_like(xm)
         if not singlet:
-            ye = d_triplet(xm, x, xcv_of(xm), u, w, kx, ku, kw, ym)   # fills ym as well
+            ye = d_triplet(xm, x, xcv_of(xm), u, w, jkx, jku, jkw, ym)   # fills ym as well
             return hyb * ym, hyb * ye
         ym[:, 0] = lib.einsum('rs,nrs->n', row_g, x)
         ym[:, 2] = lib.einsum('rs,nrs->n', row_lr, x)
         ym[:, s_cv] = (lib.einsum('pr,nrq->npq', k21_cc, x)
                        - lib.einsum('nps,qs->npq', x, k12_vv)).reshape(nvec, -1)
         ym[:, s_ov1] = lib.einsum('r,nrq->nq', j12_o1c, x)
-        ym[:, s_ov2] = (2 * jx[:, o1, vidx] - kx[:, o1, vidx]
-                        + lib.einsum('qr,nrq->nq', corr_ov2, x))
-        ym[:, s_co1] = (kx[:, cidx, o2] - 2 * jx[:, cidx, o2]
-                        + lib.einsum('ps,nps->np', corr_co1, x))
+        ym[:, s_ov2] = 2 * jkx[0] - jkx[1] + lib.einsum('qr,nrq->nq', corr_ov2, x)
+        ym[:, s_co1] = jkx[3] - 2 * jkx[2] + lib.einsum('ps,nps->np', corr_co1, x)
         ym[:, s_co2] = -lib.einsum('s,nps->np', j12_o2v, x)
 
         xcv = xm[:, s_cv].reshape(nvec, nc, nv)
         ye = (xm[:, 0, None, None] * row_g + xm[:, 2, None, None] * row_lr
               + lib.einsum('pr,npq->nrq', k21_cc, xcv) - lib.einsum('nrq,qs->nrs', xcv, k12_vv)
               + lib.einsum('r,nq->nrq', j12_o1c, xm[:, s_ov1])
-              + (2 * ju - ku)[:, cidx][:, :, vidx]
+              + 2 * jku[0] - jku[1]
               + lib.einsum('qr,nq->nrq', corr_ov2, u)
-              + (kw - 2 * jw)[:, cidx][:, :, vidx]
+              + jkw[1] - 2 * jkw[0]
               + lib.einsum('ps,np->nps', corr_co1, w)
               - lib.einsum('s,np->nps', j12_o2v, xm[:, s_co2]))
         return hyb * ym, hyb * ye.reshape(nvec, -1)
@@ -481,10 +535,11 @@ def gen_ext_vind(mf, hyb, cv, a00, focka, fockb, jmo, kmo, cidx, oidx, vidx, occ
 
 
 def gen_tda_operation(mf, mo_coeff, mo_occ, mo_core=None, hyb=None, extended=True, spc=True,
-                      singlet=True, fock=None, fock_cv=None, with_df=False):
+                      singlet=True, fock=None, fock_cv=None, with_df=False, d_mo=None):
     '''Return (vind, hdiag, e_ref) for the MRSF (extended=False) or EMRSF matrix, singlet
     or triplet. fock = (focka, fockb) and fock_cv (mo_coeff basis) replace the Fock
-    matrices computed from mf. with_df: density-fitted response integrals.'''
+    matrices computed from mf. with_df: density-fitted response integrals. d_mo: EMRSF D
+    coupling from precomputed MO integrals (None: if they fit in memory).'''
     if hyb is None:
         hyb = hybrid_coeff(mf)
     _check_hyb(mf, hyb, extended, fock)
@@ -509,7 +564,7 @@ def gen_tda_operation(mf, mo_coeff, mo_occ, mo_core=None, hyb=None, extended=Tru
     a00 = fockb[o1, o1] - focka[o2, o2] - hyb * jmo[1, 1][o1, o1]
     cv = cv_proxy(mf, mo_coeff, mo_occ, mo_core, fock_cv)
     vind_d, vind_cv_ext, hd_cv = gen_ext_vind(mfe, hyb, cv, a00, focka, fockb, jmo, kmo, cidx,
-                                              oidx, vidx, occ_diag, singlet)
+                                              oidx, vidx, occ_diag, singlet, d_mo)
 
     def vind(xs):
         xs = numpy.asarray(xs).reshape(-1, nm + hd_cv.size)
@@ -664,6 +719,9 @@ class TDA_MRSF(TDBase):
             Density-fit the two-electron integrals of the response; the reference and its
             Fock matrices stay exact. A density-fitted reference always gives a fitted
             response.
+        d_mo : bool or None
+            EMRSF D coupling from MO integrals computed once (True) or from AO J/K builds
+            in every matvec (False). None (default): MO integrals if they fit in memory.
 
     Saved results:
         e : energies relative to the triplet reference (Hartree), S0 included
@@ -677,13 +735,14 @@ class TDA_MRSF(TDBase):
     extended = False
     spc = getattr(__config__, 'mrsftda_rohf_mrsf_TDA_MRSF_spc', True)
     with_df = False
+    d_mo = None
     # dimensions up to this build the matrix from A x and use eigh
     dense_threshold = 200
     # extra roots solved by Davidson and discarded, so that no low state is missed
     nroots_extra = 3
 
     _keys = {'mo_coeff', 'mo_occ', 'fock', 'fock_cv', 'extended', 'spc',
-             'with_df', 'dense_threshold', 'nroots_extra', 'max_space', 'e_ref'}
+             'with_df', 'd_mo', 'dense_threshold', 'nroots_extra', 'max_space', 'e_ref'}
 
     def __init__(self, mf, mo_coeff=None, mo_occ=None, frozen=None, extended=None,
                  fock=None, fock_cv=None):
@@ -792,7 +851,7 @@ class TDA_MRSF(TDBase):
         fock_cv = None if self.fock_cv is None else numpy.asarray(self.fock_cv)[oo]
         vind, hdiag, self.e_ref = gen_tda_operation(
             self._scf, self.mo_coeff[:, idx], self.mo_occ[idx], mo_core, self.get_hyb(),
-            self.extended, self.spc, self.singlet, fock, fock_cv, self.with_df)
+            self.extended, self.spc, self.singlet, fock, fock_cv, self.with_df, self.d_mo)
         if self._e_ref is not None:
             self.e_ref = self._e_ref
         return vind, hdiag

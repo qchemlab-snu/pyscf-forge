@@ -273,6 +273,9 @@ class KnownValues(unittest.TestCase):
         for extended in (False, True):
             td = mrsftda.TDA_MRSF(kmf, frozen=frozen, extended=extended)
             e = td.kernel(nstates=3)[0]
+            if extended:
+                td.d_mo = False
+                self.assertAlmostEqual(abs(td.kernel(nstates=3)[0] - e).max(), 0, 9)
             ti = mrsftda.TDA_MRSF.given_mo_ints(h1e, eri, occ_act, e_core=e_core, extended=extended)
             self.assertAlmostEqual(abs(ti.kernel(nstates=3)[0] - e).max(), 0, 9)
             self.assertAlmostEqual(ti.e_ref, td.e_ref, 9)
@@ -286,6 +289,27 @@ class KnownValues(unittest.TestCase):
             self.assertLess(abs(e - e0).max(), 2e-4)
             td.dense_threshold = 0
             self.assertAlmostEqual(abs(td.kernel(nstates=5)[0] - e).max(), 0, 8)
+
+    def test_d_mo(self):
+        # EMRSF D coupling from MO integrals = from AO J/K (frozen core, DF, given_mo_ints)
+        nfc, nact = 1, 9
+        c_core, c_act, occ_act, h1e, e_core = active_space(mf_hf, nfc, nact)
+        frozen = list(range(nfc)) + list(range(nfc + nact, mf_hf.mo_occ.size))
+        eri = ao2mo.restore(1, ao2mo.full(mol, c_act), nact)
+        tds = [lambda: mrsftda.TDA_MRSF(mf_ks, extended=True),
+               lambda: mrsftda.TDA_MRSF(mf_hf, frozen=frozen, extended=True),
+               lambda: mrsftda.TDA_MRSF(mf_ks, extended=True).set(with_df=True),
+               lambda: mrsftda.TDA_MRSF.given_mo_ints(h1e, eri, occ_act, e_core=e_core,
+                                                      extended=True)]
+        for make in tds:
+            for singlet in (True, False):
+                a = []
+                for d_mo in (True, False):
+                    td = make()
+                    td.singlet = singlet
+                    td.d_mo = d_mo
+                    a.append(td.get_ab())
+                self.assertAlmostEqual(abs(a[0] - a[1]).max(), 0, 10)
 
     def test_orbital_order(self):
         # orbitals not ordered as doubly occupied, open, empty (e.g. after MOM)
