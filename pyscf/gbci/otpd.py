@@ -64,11 +64,6 @@ libgbpdft.GBPDFTcontract_active_pair.argtypes = [
     _int_ptr, ctypes.c_int, _int_ptr, ctypes.c_int,
     ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, _double_ptr,
 ]
-libgbpdft.GBPDFTcontract_core_pair.argtypes = [
-    _double_ptr, _double_ptr, _double_ptr, ctypes.c_int,
-    _double_ptr, ctypes.c_int, _double_ptr, _double_ptr, _double_ptr,
-    ctypes.c_int, ctypes.c_int, ctypes.c_int, _double_ptr,
-]
 
 
 def _as_real_contiguous(arr, name, dtype=np.float64):
@@ -99,26 +94,25 @@ def make_otpd_intermediates(S, mo_coeff, ncas, nelecas, ncore,
         for p2 in range(ngroup):
             dcore_mo[p1, p2] = CdagS @ dmet_core_list[p1, p2] @ Smo
 
-    kpair = ngroup * ngroup
-    Dpair = np.empty((nmo, nmo, kpair), dtype=dtype)
-    for p1 in range(ngroup):
-        for p2 in range(ngroup):
-            Dpair[:, :, p1 * ngroup + p2] = dcore_mo[p1, p2]
+    # m^T D_qp m = m^T D_pq m when D_qp = D_pq^T, so only p <= q is needed
+    dmax = np.abs(dcore_mo).max() if dcore_mo.size else 0.0
+    pair_sym = all(
+        np.allclose(dcore_mo[p2, p1], dcore_mo[p1, p2].T,
+                    rtol=0, atol=1e-12 * max(dmax, 1.0))
+        for p1 in range(ngroup) for p2 in range(p1 + 1, ngroup))
 
     plist = conf_info_list.reshape(-1)
     group_p, inv_p = np.unique(plist, return_inverse=True)
-    dgroup = dcore_mo[group_p, group_p]
 
     data.update({
         "S": S,
         "ngroup": ngroup,
-        "Kpair": kpair,
+        "Kpair": ngroup * ngroup,
         "dcore_mo": dcore_mo,
-        "Dpair": Dpair,
+        "pair_sym": pair_sym,
         "plist": plist,
         "group_p": group_p,
         "inv_p": inv_p,
-        "dgroup_T": np.transpose(dgroup, (1, 2, 0)).copy(),
     })
     return data
 
@@ -170,24 +164,43 @@ def _contract_active_pair(ci, conf_info_list, ov_list, t1a, t1b, ncas):
     return out
 
 
-def _contract_core_pair(M, Ma, Dgroup_pack, Dpair_pack, Ka, Kb, wgroup):
-    """Accumulate core-core and active-core pair-density terms on a grid."""
-    ngrids = M.shape[0]
-    nmo = M.shape[1]
-    ncas = Ma.shape[1]
-    ndiag = Dgroup_pack.shape[0]
-    kpair = Dpair_pack.shape[0]
-    M = _as_real_contiguous(M, "M")
-    Ma = _as_real_contiguous(Ma, "Ma")
-    Dgroup_pack = _as_real_contiguous(Dgroup_pack, "Dgroup_pack")
-    Dpair_pack = _as_real_contiguous(Dpair_pack, "Dpair_pack")
-    Ka = _as_real_contiguous(Ka, "Ka")
-    Kb = _as_real_contiguous(Kb, "Kb")
-    wgroup = _as_real_contiguous(wgroup, "wgroup")
-    out = np.empty(ngrids, dtype=np.float64)
-    libgbpdft.GBPDFTcontract_core_pair(
-        M, Ma, Dgroup_pack, ndiag, Dpair_pack, kpair, Ka, Kb, wgroup,
-        ngrids, nmo, ncas, out)
+def _core_pair_terms(data, Ka, Kb, wgroup):
+    """Collect the group pairs (p, q) that enter the core-pair term.
+
+    Pi_core(r) = sum_pq m^T D_pq m (A_pq(r) + w_pq m^T D_pq m), with
+    A_pq(r) = sum_ai m_a m_i (Ka + Kb)[a, i, pq] and w_pq = wgroup for p = q.
+    With D_qp = D_pq^T the (q, p) term is folded into (p, q). Pairs whose
+    A and w vanish exactly are dropped.
+    """
+    ngroup = data["ngroup"]
+    ncas = Ka.shape[0]
+    Ksum = (Ka + Kb).reshape(ncas * ncas, ngroup, ngroup)
+    wdiag = np.zeros(ngroup, dtype=wgroup.dtype)
+    wdiag[data["group_p"]] = wgroup
+    if data["pair_sym"]:
+        p, q = np.triu_indices(ngroup)
+        kpair = Ksum[:, p, q] + Ksum[:, q, p] * (p != q)
+    else:
+        p, q = np.indices((ngroup, ngroup)).reshape(2, -1)
+        kpair = Ksum[:, p, q]
+    wpair = np.where(p == q, wdiag[p], 0)
+    keep = (wpair != 0) | np.any(kpair != 0, axis=0)
+    return (p[keep], q[keep], np.ascontiguousarray(kpair[:, keep]),
+            wpair[keep])
+
+
+def _contract_core_pair(M, Ma, dcore_mo, pair_p, pair_q, pair_coeff, wpair,
+                        blksize=64):
+    """Core-core and active-core pair-density terms on a grid block (BLAS)."""
+    ngrids, ncas = Ma.shape
+    MaMa = (Ma[:, :, None] * Ma[:, None, :]).reshape(ngrids, ncas * ncas)
+    out = np.zeros(ngrids, dtype=np.result_type(M, dcore_mo, pair_coeff))
+    for j0 in range(0, len(pair_p), blksize):
+        j1 = min(j0 + blksize, len(pair_p))
+        A = MaMa @ pair_coeff[:, j0:j1]
+        for j in range(j0, j1):
+            qv = np.einsum("gi,gi->g", M @ dcore_mo[pair_p[j], pair_q[j]], M)
+            out += qv * (A[:, j - j0] + wpair[j] * qv)
     return out
 
 
@@ -222,16 +235,17 @@ def make_root_intermediates(ci, data):
     Kb = _contract_beta_core(
         ci_contig, conf_info_contig, ov_contig, t1b, ncas, ngroup)
 
+    pair_p, pair_q, pair_coeff, wpair = _core_pair_terms(data, Ka, Kb, wgroup)
+
     return {
         "wgroup": wgroup,
-        "dgroup_T": data["dgroup_T"],
-        "Dpair": data["Dpair"],
-        "Dgroup_pack": np.ascontiguousarray(
-            data["dgroup_T"].transpose(2, 0, 1)),
-        "Dpair_pack": np.ascontiguousarray(data["Dpair"].transpose(2, 0, 1)),
         "Gamma_ab_ac": Gamma_ab_ac,
         "Ka": Ka,
         "Kb": Kb,
+        "pair_p": pair_p,
+        "pair_q": pair_q,
+        "pair_coeff": pair_coeff,
+        "wpair": wpair,
     }
 
 
@@ -276,9 +290,9 @@ def get_ontop_pair_density(ot, ao, ci, data, mo=None, deriv=0,
         Pi[0] += lib.einsum("ga,gb,gab->g", Ma, Ma, tmp, optimize=True)
 
     Pi[0] += _contract_core_pair(
-        np.ascontiguousarray(M), np.ascontiguousarray(Ma),
-        ot_root_cache["Dgroup_pack"], ot_root_cache["Dpair_pack"],
-        ot_root_cache["Ka"], ot_root_cache["Kb"], ot_root_cache["wgroup"])
+        np.ascontiguousarray(M), Ma, data["dcore_mo"],
+        ot_root_cache["pair_p"], ot_root_cache["pair_q"],
+        ot_root_cache["pair_coeff"], ot_root_cache["wpair"])
 
     if ao_shape:
         ao = ao.reshape(ao.shape[1], ao.shape[2])
