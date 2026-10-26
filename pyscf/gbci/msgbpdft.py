@@ -55,7 +55,7 @@ def _as_ci_list(ci):
 
 def _contract_hamiltonian(solver, erieff, civec, ncas, nelecas,
                           conf_info_list, ov_list, ecore_list, link_index,
-                          ts, t_nonzero):
+                          ts):
     if hasattr(solver, "base") and hasattr(solver, "ss_penalty"):
         old_contract = getattr(solver, "_contract_h_base", None)
         had_contract = hasattr(solver, "_contract_h_base")
@@ -63,7 +63,7 @@ def _contract_hamiltonian(solver, erieff, civec, ncas, nelecas,
         try:
             return solver.contract_h(
                 erieff, civec, ncas, nelecas, conf_info_list, ov_list,
-                ecore_list, link_index, ts, t_nonzero)
+                ecore_list, link_index, ts)
         finally:
             if had_contract:
                 solver._contract_h_base = old_contract
@@ -71,7 +71,7 @@ def _contract_hamiltonian(solver, erieff, civec, ncas, nelecas,
                 del solver._contract_h_base
     return solver.contract_h(
         erieff, civec, ncas, nelecas, conf_info_list, ov_list,
-        ecore_list, link_index, ts, t_nonzero)
+        ecore_list, link_index, ts)
 
 
 def make_heff_gbci(mc, mo_coeff=None, ci=None):
@@ -93,17 +93,14 @@ def make_heff_gbci(mc, mo_coeff=None, ci=None):
     link_indexa = cistring.gen_linkstr_index(range(mc.ncas), mc.nelecas[0])
     link_indexb = cistring.gen_linkstr_index(range(mc.ncas), mc.nelecas[1])
     link_index = (link_indexa, link_indexb)
-    na = cistring.num_strings(mc.ncas, mc.nelecas[0])
-    nb = cistring.num_strings(mc.ncas, mc.nelecas[1])
-    ts = direct_gbci.gen_excitations(mc.ncas, mc.nelecas, na, nb, link_index)
-    t_nonzero = direct_gbci.gen_nonzero_excitations(*ts)
+    ts = direct_gbci.gen_excitations(mc.ncas, mc.nelecas, link_index=link_index)
 
     hci = []
     for civec in ci_list:
         hc = _contract_hamiltonian(
             mc.fcisolver, erieff, np.asarray(civec), mc.ncas, mc.nelecas,
             intermediates["conf_info_list"], intermediates["ov_list"],
-            ecore_list, link_index, ts, t_nonzero)
+            ecore_list, link_index, ts)
         hci.append(np.asarray(hc).reshape(np.asarray(civec).shape))
 
     nroots = len(ci_list)

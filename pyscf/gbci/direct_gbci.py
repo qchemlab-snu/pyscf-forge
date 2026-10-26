@@ -96,7 +96,48 @@ def absorb_h1e(h1e, eri, ncas, nelecas, fac=1):
         erieff[:,:,:,:,k,k] += f1e
     return erieff * fac
 
-def gen_excitations(ncas, nelecas, na, nb, link_index=None):
+def _link_entries(link_index):
+    link_index = numpy.asarray(link_index)
+    nstr, nlink = link_index.shape[:2]
+    str0 = numpy.repeat(numpy.arange(nstr, dtype=numpy.int32), nlink)
+    a1, i1, str1, sign1 = link_index.reshape(-1, 4).T
+    return a1, i1, str1, str0, sign1
+
+def gen_single_excitation_list(link_index):
+    '''Signed single excitations E_ai of one spin string space.
+
+    Returns (n1, 5) int32, rows [a, i, str1, str0, sign] for
+    str1 = E_ai str0, ordered as numpy.nonzero orders the dense table
+    t1[a,i,str1,str0].
+    '''
+    a1, i1, str1, str0, sign1 = _link_entries(link_index)
+    order = numpy.lexsort((str0, str1, i1, a1))
+    t1 = numpy.stack((a1, i1, str1, str0, sign1), axis=1)[order]
+    return numpy.ascontiguousarray(t1, dtype=numpy.int32)
+
+def gen_excitation_list(link_index):
+    '''Signed single and double excitations of one spin string space.
+
+    Returns
+        t1 : see gen_single_excitation_list
+        t2 : (n2, 7) int32, rows [a2, i2, a1, i1, str2, str0, sign] for
+             str2 = E_a2i2 E_a1i1 str0, ordered as numpy.nonzero orders the
+             dense table t2[a2,i2,a1,i1,str2,str0].
+    '''
+    link_index = numpy.asarray(link_index)
+    nlink = link_index.shape[1]
+    a1, i1, str1, str0, sign1 = _link_entries(link_index)
+    a2, i2, str2, sign2 = link_index[str1].reshape(-1, 4).T
+    a1, i1, str0, sign1 = [numpy.repeat(x, nlink) for x in (a1, i1, str0, sign1)]
+    order = numpy.lexsort((str0, str2, i1, a1, i2, a2))
+    t2 = numpy.stack((a2, i2, a1, i1, str2, str0, sign1 * sign2), axis=1)[order]
+    return (gen_single_excitation_list(link_index),
+            numpy.ascontiguousarray(t2, dtype=numpy.int32))
+
+def gen_excitations(ncas, nelecas, na=None, nb=None, link_index=None):
+    '''Signed excitation lists (t1a, t1b, t2aa, t2bb), see gen_excitation_list.
+    na and nb are not used.
+    '''
     if isinstance(nelecas, (int, numpy.integer)):
         nelecb = nelecas//2
         neleca = nelecas - nelecb
@@ -107,32 +148,15 @@ def gen_excitations(ncas, nelecas, na, nb, link_index=None):
         link_indexb = cistring.gen_linkstr_index(range(ncas), nelecb)
     else:
         link_indexa, link_indexb = link_index
-    t2aa = numpy.zeros((ncas,ncas,ncas,ncas,na,na), dtype=numpy.int32)
-    t2bb = numpy.zeros((ncas,ncas,ncas,ncas,nb,nb), dtype=numpy.int32)
-    t1a = numpy.zeros((ncas,ncas,na,na), dtype=numpy.int32)
-    t1b = numpy.zeros((ncas,ncas,nb,nb), dtype=numpy.int32)
-    for str0a , taba in enumerate(link_indexa):
-        for a1, i1, str1a, signa1 in link_indexa[str0a]:
-            t1a[a1,i1,str1a,str0a] += signa1
-            for a2 , i2, str2a, signa2 in link_indexa[str1a]:
-                t2aa[a2, i2, a1, i1, str2a, str0a] += signa1 * signa2
-    for str0b , tabb in enumerate(link_indexb):
-        for a1, i1, str1b, signb1 in link_indexb[str0b]:
-            t1b[a1,i1,str1b,str0b] += signb1
-            for a2 , i2, str2b, signb2 in link_indexb[str1b]:
-                t2bb[a2, i2, a1, i1, str2b, str0b] += signb1 * signb2
+    t1a, t2aa = gen_excitation_list(link_indexa)
+    t1b, t2bb = gen_excitation_list(link_indexb)
     return t1a, t1b, t2aa, t2bb
 
-def gen_nonzero_excitations(t1a, t1b, t2aa, t2bb):
-    t1a_nonzero = numpy.array(numpy.array(numpy.nonzero(t1a)).T, order = 'C', dtype = numpy.int32)
-    t1b_nonzero = numpy.array(numpy.array(numpy.nonzero(t1b)).T, order = 'C', dtype = numpy.int32)
-    t2aa_nonzero = numpy.array(numpy.array(numpy.nonzero(t2aa)).T, order = 'C', dtype = numpy.int32)
-    t2bb_nonzero = numpy.array(numpy.array(numpy.nonzero(t2bb)).T, order = 'C', dtype = numpy.int32)
-    return t1a_nonzero, t1b_nonzero, t2aa_nonzero, t2bb_nonzero
-
 def contract_h(erieff, civec, ncas, nelecas, conf_info_list, ov_list, ecore_list,
-               link_index=None, ts=None, t_nonzero=None):
+               link_index=None, ts=None):
     '''Compute H|CI>
+
+    ts : the signed excitation lists from gen_excitations
     '''
     if isinstance(nelecas, (int, numpy.integer)):
         nelecb = nelecas//2
@@ -144,20 +168,8 @@ def contract_h(erieff, civec, ncas, nelecas, conf_info_list, ov_list, ecore_list
     nb = cistring.num_strings(ncas,nelecb)
 
     if ts is None:
-        if link_index is None:
-            link_indexa = cistring.gen_linkstr_index(range(ncas), neleca)
-            link_indexb = cistring.gen_linkstr_index(range(ncas), nelecb)
-            link_index = (link_indexa, link_indexb)
-        else:
-            link_indexa, link_indexb = link_index
-        t1a, t1b, t2aa, t2bb= gen_excitations(ncas, nelecas,na,nb,link_index)
-    else:
-        t1a, t1b, t2aa, t2bb = ts
-    if t_nonzero is None:
-        t1a_nonzero, t1b_nonzero, t2aa_nonzero, t2bb_nonzero = \
-            gen_nonzero_excitations(t1a, t1b, t2aa, t2bb)
-    else:
-        t1a_nonzero, t1b_nonzero, t2aa_nonzero, t2bb_nonzero = t_nonzero
+        ts = gen_excitations(ncas, nelecas, link_index=link_index)
+    t1a, t1b, t2aa, t2bb = ts
 
     civec = numpy.asarray(civec, order = 'C')
     cinew = numpy.zeros_like(civec)
@@ -165,10 +177,6 @@ def contract_h(erieff, civec, ncas, nelecas, conf_info_list, ov_list, ecore_list
     conf_info_list = numpy.asarray(conf_info_list, order = 'C', dtype = numpy.int32)
     stringsa = cistring.make_strings(range(ncas),neleca)
     stringsb = cistring.make_strings(range(ncas),nelecb)
-    t1ann = t1a_nonzero.shape[0]
-    t1bnn = t1b_nonzero.shape[0]
-    t2aann = t2aa_nonzero.shape[0]
-    t2bbnn = t2bb_nonzero.shape[0]
     ov_list = numpy.asarray(ov_list, order = 'C', dtype=numpy.float64)
     ecore_list = numpy.asarray(ecore_list, order = 'C', dtype=numpy.float64)
     mo_num = erieff.shape[0]
@@ -181,14 +189,10 @@ def contract_h(erieff, civec, ncas, nelecas, conf_info_list, ov_list, ecore_list
          ctypes.c_int(na), stringsa.ctypes.data_as(ctypes.c_void_p),
          ctypes.c_int(nb), stringsb.ctypes.data_as(ctypes.c_void_p),
          ctypes.c_int(mo_num),
-         t1a.ctypes.data_as(ctypes.c_void_p),
-         t1a_nonzero.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(t1ann),
-         t1b.ctypes.data_as(ctypes.c_void_p),
-         t1b_nonzero.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(t1bnn),
-         t2aa.ctypes.data_as(ctypes.c_void_p),
-         t2aa_nonzero.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(t2aann),
-         t2bb.ctypes.data_as(ctypes.c_void_p),
-         t2bb_nonzero.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(t2bbnn),
+         t1a.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(t1a.shape[0]),
+         t1b.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(t1b.shape[0]),
+         t2aa.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(t2aa.shape[0]),
+         t2bb.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(t2bb.shape[0]),
          ov_list.ctypes.data_as(ctypes.c_void_p), ecore_list.ctypes.data_as(ctypes.c_void_p))
     return cinew
 
@@ -320,8 +324,6 @@ def kernel(gbci, h1e, eri, ncas, nelecas, conf_info_list, ov_list, ecore_list,
     precond = gbci.make_precond(hdiag)
     addr = [0]
     erieff = gbci.absorb_h1e(h1e, eri, ncas, nelec, .5)
-    na = cistring.num_strings(ncas, nelec[0])
-    nb = cistring.num_strings(ncas, nelec[1])
     if link_index is None:
         link_indexa = cistring.gen_linkstr_index(range(ncas), nelec[0])
         link_indexb = cistring.gen_linkstr_index(range(ncas), nelec[1])
@@ -329,13 +331,12 @@ def kernel(gbci, h1e, eri, ncas, nelecas, conf_info_list, ov_list, ecore_list,
     else:
         link_indexa, link_indexb = link_index
 
-    ts = gen_excitations(ncas, nelecas, na, nb, link_index)
-    t_nonzero = gen_nonzero_excitations(ts[0], ts[1], ts[2], ts[3])
+    ts = gen_excitations(ncas, nelecas, link_index=link_index)
     if hop is None:
         cpu0 = [logger.process_clock(), logger.perf_counter()]
         def hop(c):
             hc = gbci.contract_h(erieff, c, ncas, nelecas, conf_info_list,
-                                   ov_list, ecore_list,link_index, ts, t_nonzero)
+                                   ov_list, ecore_list, link_index, ts)
             cpu0[:] = log.timer_debug1('contract_h', *cpu0)
             return hc.ravel()
     def init_guess():
@@ -433,9 +434,9 @@ class GBCISolver(FCISolver):
         return absorb_h1e(h1e, eri, ncas, nelecas, fac)
 
     def contract_h(self, erieff, civec, ncas, nelecas, conf_info_list, ov_list,
-                 ecore_list, link_index=None, ts=None, t_nonzero=None):
+                 ecore_list, link_index=None, ts=None):
         return contract_h(erieff, civec, ncas, nelecas, conf_info_list, ov_list,
-                        ecore_list ,link_index, ts, t_nonzero)
+                        ecore_list ,link_index, ts)
 
     def contract_h_slow(self, erieff, civec, ncas, nelecas, conf_info_list, ov_list,
                  ecore_list, link_index=None):
@@ -546,7 +547,7 @@ class SpinPenaltyGBCISolver:
         return self.base
 
     def contract_h(self, erieff, civec, ncas, nelecas, conf_info_list, ov_list,
-                   ecore_list, link_index=None, ts=None, t_nonzero=None, **kwargs):
+                   ecore_list, link_index=None, ts=None, **kwargs):
         # --- spin penalty part (uses base.contract_ss, which is safe) ---
         if isinstance(nelecas, (int, np.number)):
             sz = (nelecas % 2) * 0.5
@@ -566,16 +567,16 @@ class SpinPenaltyGBCISolver:
 
         ci0 = self._contract_h_base(erieff, civec, ncas, nelecas,
                                     conf_info_list, ov_list, ecore_list,
-                                    link_index, ts, t_nonzero, **kwargs)
+                                    link_index, ts, **kwargs)
         return ci0.reshape(civec.shape) + ci1
 
     def kernel(self, *args, **kwargs):
         self._contract_h_base = self.base.contract_h
 
         def _proxy_contract_h(erieff, civec, ncas, nelecas, conf_info_list, ov_list,
-                              ecore_list, link_index=None, ts=None, t_nonzero=None, **kw):
+                              ecore_list, link_index=None, ts=None, **kw):
             return self.contract_h(erieff, civec, ncas, nelecas, conf_info_list,
-                                   ov_list, ecore_list, link_index, ts, t_nonzero, **kw)
+                                   ov_list, ecore_list, link_index, ts, **kw)
 
         self.base.contract_h = _proxy_contract_h
         try:
