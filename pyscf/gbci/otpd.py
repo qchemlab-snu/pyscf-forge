@@ -74,6 +74,34 @@ def _as_real_contiguous(arr, name, dtype=np.float64):
     return np.ascontiguousarray(arr, dtype=dtype)
 
 
+def _core_factors(S, mo_coeff, dmet_core_list):
+    """Factor the core transition densities through each bath's core space.
+
+    D^pq (AO) is built from the core orbitals of baths p and q, so in the MO
+    basis D^pq = c_p M^pq c_q^T, where c_p (n_MO x n_core) spans bath p's
+    core and is read off D^pp, the projector onto it. Then
+    phi^T D^pq phi = b_p^T M^pq b_q with b_p = c_p^T phi.
+
+    Returns the stacked bases (n_MO x sum n_core), their column offsets and
+    M^pq keyed by (p, q).
+    """
+    ngroup = dmet_core_list.shape[0]
+    CdagS = mo_coeff.conj().T @ S
+    bases = []
+    for p in range(ngroup):
+        dpp = CdagS @ dmet_core_list[p, p] @ CdagS.conj().T
+        u, s, _ = np.linalg.svd(dpp)
+        rank = int(np.count_nonzero(s > 1e-8 * max(s[0], 1.0))) if s.size else 0
+        bases.append(u[:, :rank])
+    core_offsets = np.cumsum([0] + [c.shape[1] for c in bases])
+    left = [c.conj().T @ CdagS for c in bases]
+    core_coupling = {}
+    for p in range(ngroup):
+        for q in range(ngroup):
+            core_coupling[p, q] = left[p] @ dmet_core_list[p, q] @ left[q].conj().T
+    return np.hstack(bases), core_offsets, core_coupling
+
+
 def make_otpd_intermediates(S, mo_coeff, ncas, nelecas, ncore,
                             dmet_core_list, conf_info_list, ov_list):
     """Build CI-independent intermediates for the GBPDFT pair density."""
@@ -82,22 +110,17 @@ def make_otpd_intermediates(S, mo_coeff, ncas, nelecas, ncore,
         conf_info_list, ov_list)
     data = dict(data)
 
-    _, nmo = mo_coeff.shape
     conf_info_list = data["conf_info_list"]
     ov_list = data["ov_list"]
-    dtype = data["dtype"]
     ngroup = ov_list.shape[0]
-    dcore_mo = np.empty((ngroup, ngroup, nmo, nmo), dtype=dtype)
-    Smo = S @ mo_coeff
-    CdagS = mo_coeff.conj().T @ S
-    for p1 in range(ngroup):
-        for p2 in range(ngroup):
-            dcore_mo[p1, p2] = CdagS @ dmet_core_list[p1, p2] @ Smo
+    core_basis, core_offsets, core_coupling = _core_factors(
+        S, mo_coeff, dmet_core_list)
 
     # m^T D_qp m = m^T D_pq m when D_qp = D_pq^T, so only p <= q is needed
-    dmax = np.abs(dcore_mo).max() if dcore_mo.size else 0.0
+    dmax = max((np.abs(x).max() for x in core_coupling.values() if x.size),
+               default=0.0)
     pair_sym = all(
-        np.allclose(dcore_mo[p2, p1], dcore_mo[p1, p2].T,
+        np.allclose(core_coupling[p2, p1], core_coupling[p1, p2].T,
                     rtol=0, atol=1e-12 * max(dmax, 1.0))
         for p1 in range(ngroup) for p2 in range(p1 + 1, ngroup))
 
@@ -108,7 +131,9 @@ def make_otpd_intermediates(S, mo_coeff, ncas, nelecas, ncore,
         "S": S,
         "ngroup": ngroup,
         "Kpair": ngroup * ngroup,
-        "dcore_mo": dcore_mo,
+        "core_basis": core_basis,
+        "core_offsets": core_offsets,
+        "core_coupling": core_coupling,
         "pair_sym": pair_sym,
         "plist": plist,
         "group_p": group_p,
@@ -167,7 +192,7 @@ def _contract_active_pair(ci, conf_info_list, ov_list, t1a, t1b, ncas):
 def _core_pair_terms(data, Ka, Kb, wgroup):
     """Collect the group pairs (p, q) that enter the core-pair term.
 
-    Pi_core(r) = sum_pq m^T D_pq m (A_pq(r) + w_pq m^T D_pq m), with
+    Pi_core(r) = sum_pq rho^pq (A_pq(r) + w_pq rho^pq), rho^pq = m^T D_pq m,
     A_pq(r) = sum_ai m_a m_i (Ka + Kb)[a, i, pq] and w_pq = wgroup for p = q.
     With D_qp = D_pq^T the (q, p) term is folded into (p, q). Pairs whose
     A and w vanish exactly are dropped.
@@ -189,18 +214,31 @@ def _core_pair_terms(data, Ka, Kb, wgroup):
             wpair[keep])
 
 
-def _contract_core_pair(M, Ma, dcore_mo, pair_p, pair_q, pair_coeff, wpair,
-                        blksize=64):
-    """Core-core and active-core pair-density terms on a grid block (BLAS)."""
+def _contract_core_pair(M, Ma, data, pair_p, pair_q, pair_coeff, wpair,
+                        blksize=64, grid_blksize=4096):
+    """Core-core and active-core pair-density terms on a grid block (BLAS).
+
+    rho^pq = b_p^T M^pq b_q with b_p = c_p^T phi, see _core_factors.
+    """
+    basis = data["core_basis"]
+    off = data["core_offsets"]
+    coupling = data["core_coupling"]
     ngrids, ncas = Ma.shape
-    MaMa = (Ma[:, :, None] * Ma[:, None, :]).reshape(ngrids, ncas * ncas)
-    out = np.zeros(ngrids, dtype=np.result_type(M, dcore_mo, pair_coeff))
-    for j0 in range(0, len(pair_p), blksize):
-        j1 = min(j0 + blksize, len(pair_p))
-        A = MaMa @ pair_coeff[:, j0:j1]
-        for j in range(j0, j1):
-            qv = np.einsum("gi,gi->g", M @ dcore_mo[pair_p[j], pair_q[j]], M)
-            out += qv * (A[:, j - j0] + wpair[j] * qv)
+    out = np.zeros(ngrids, dtype=np.result_type(M, basis, pair_coeff))
+    for g0 in range(0, ngrids, grid_blksize):
+        g1 = min(g0 + grid_blksize, ngrids)
+        B = M[g0:g1] @ basis
+        Mag = Ma[g0:g1]
+        MaMa = (Mag[:, :, None] * Mag[:, None, :]).reshape(g1 - g0, ncas * ncas)
+        for j0 in range(0, len(pair_p), blksize):
+            j1 = min(j0 + blksize, len(pair_p))
+            A = MaMa @ pair_coeff[:, j0:j1]
+            for j in range(j0, j1):
+                p, q = pair_p[j], pair_q[j]
+                Bp = B[:, off[p]:off[p + 1]]
+                Bq = B[:, off[q]:off[q + 1]]
+                qv = np.einsum("gi,gi->g", Bp @ coupling[p, q], Bq)
+                out[g0:g1] += qv * (A[:, j - j0] + wpair[j] * qv)
     return out
 
 
@@ -290,7 +328,7 @@ def get_ontop_pair_density(ot, ao, ci, data, mo=None, deriv=0,
         Pi[0] += lib.einsum("ga,gb,gab->g", Ma, Ma, tmp, optimize=True)
 
     Pi[0] += _contract_core_pair(
-        np.ascontiguousarray(M), Ma, data["dcore_mo"],
+        np.ascontiguousarray(M), Ma, data,
         ot_root_cache["pair_p"], ot_root_cache["pair_q"],
         ot_root_cache["pair_coeff"], ot_root_cache["wpair"])
 
