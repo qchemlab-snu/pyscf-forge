@@ -22,6 +22,7 @@ import numpy
 import numpy as np
 from pyscf import lib
 from pyscf.fci import cistring
+from pyscf.gbci import direct_gbci
 
 def precompute_rdm1s_data(mo_coeff, ncas, nelecas, ncore,
                           dmet_core_list, conf_info_list, ov_list):
@@ -37,15 +38,6 @@ def precompute_rdm1s_data(mo_coeff, ncas, nelecas, ncore,
     nb = cistring.num_strings(ncas, nelecas[1])
     dtype = np.result_type(mo_coeff, dmet_core_list, ov_list, np.float64)
 
-    t1a = np.zeros((ncas, ncas, na, na), dtype=dtype)
-    t1b = np.zeros((ncas, ncas, nb, nb), dtype=dtype)
-    for str0a in range(na):
-        for a1, i1, str1a, signa1 in link_indexa[str0a]:
-            t1a[a1, i1, str1a, str0a] += signa1
-    for str0b in range(nb):
-        for a1, i1, str1b, signb1 in link_indexb[str0b]:
-            t1b[a1, i1, str1b, str0b] += signb1
-
     return {
         "mo_coeff": mo_coeff,
         "ncas": ncas,
@@ -56,10 +48,9 @@ def precompute_rdm1s_data(mo_coeff, ncas, nelecas, ncore,
         "na": na,
         "nb": nb,
         "sl": sl,
-        "t1a": t1a,
-        "t1b": t1b,
-        "t1a_nz": np.array(np.nonzero(t1a)).T.astype(np.int64),
-        "t1b_nz": np.array(np.nonzero(t1b)).T.astype(np.int64),
+        # signed lists, rows [a, i, str1, str0, sign]
+        "t1a": direct_gbci.gen_single_excitation_list(link_indexa),
+        "t1b": direct_gbci.gen_single_excitation_list(link_indexb),
         "dmet_core_list": dmet_core_list,
         "conf_info_list": conf_info_list,
         "ov_list": ov_list,
@@ -82,8 +73,6 @@ def trans_rdm1s_precomputed(ci_bra, ci_ket, data, dmet_core_list=None,
     sl = data["sl"]
     t1a = data["t1a"]
     t1b = data["t1b"]
-    t1a_nz = data["t1a_nz"]
-    t1b_nz = data["t1b_nz"]
     conf_info_list = data["conf_info_list"]
     ov_list = data["ov_list"]
     plist = data["plist"]
@@ -104,21 +93,21 @@ def trans_rdm1s_precomputed(ci_bra, ci_ket, data, dmet_core_list=None,
     rdm1a_act = np.zeros((ncas, ncas), dtype=dtype)
     rdm1b_act = np.zeros((ncas, ncas), dtype=dtype)
 
-    for aa, ia, str1a, str0a in t1a_nz:
+    for aa, ia, str1a, str0a, signa in t1a:
         p1 = conf_info_list[str1a, :]
         p2 = conf_info_list[str0a, :]
         fac = (
             np.conjugate(ci_bra[str1a, :]) * ci_ket[str0a, :] *
             ov_list[p1, p2])
-        rdm1a_act[aa, ia] += t1a[aa, ia, str1a, str0a] * fac.sum()
+        rdm1a_act[aa, ia] += signa * fac.sum()
 
-    for ab, ib, str1b, str0b in t1b_nz:
+    for ab, ib, str1b, str0b, signb in t1b:
         p1 = conf_info_list[:, str1b]
         p2 = conf_info_list[:, str0b]
         fac = (
             np.conjugate(ci_bra[:, str1b]) * ci_ket[:, str0b] *
             ov_list[p1, p2])
-        rdm1b_act[ab, ib] += t1b[ab, ib, str1b, str0b] * fac.sum()
+        rdm1b_act[ab, ib] += signb * fac.sum()
 
     mo_cas = mo_coeff[:, sl]
     rdm1a_act_ao = lib.einsum(

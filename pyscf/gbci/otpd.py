@@ -50,17 +50,17 @@ _int_ptr = np.ctypeslib.ndpointer(dtype=np.int32, ndim=None,
                                   flags=("C_CONTIGUOUS", "ALIGNED"))
 
 libgbpdft.GBPDFTcontract_alpha_core.argtypes = [
-    _double_ptr, _int_ptr, _double_ptr, _double_ptr, _int_ptr,
+    _double_ptr, _int_ptr, _double_ptr, _int_ptr,
     ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
     _double_ptr,
 ]
 libgbpdft.GBPDFTcontract_beta_core.argtypes = [
-    _double_ptr, _int_ptr, _double_ptr, _double_ptr, _int_ptr,
+    _double_ptr, _int_ptr, _double_ptr, _int_ptr,
     ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
     _double_ptr,
 ]
 libgbpdft.GBPDFTcontract_active_pair.argtypes = [
-    _double_ptr, _int_ptr, _double_ptr, _double_ptr, _double_ptr,
+    _double_ptr, _int_ptr, _double_ptr,
     _int_ptr, ctypes.c_int, _int_ptr, ctypes.c_int,
     ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, _double_ptr,
 ]
@@ -123,56 +123,49 @@ def make_otpd_intermediates(S, mo_coeff, ncas, nelecas, ncore,
     return data
 
 
-def _contract_alpha_core(ci, conf_info_list, ov_list, t1a, t1a_nz,
-                         ncas, ngroup):
+def _contract_alpha_core(ci, conf_info_list, ov_list, t1a, ncas, ngroup):
     """Build the alpha active-core contraction tensor with the C backend."""
     na, nb = ci.shape
     kpair = ngroup * ngroup
     ci = _as_real_contiguous(ci, "ci")
     conf_info_list = np.ascontiguousarray(conf_info_list, dtype=np.int32)
     ov_list = _as_real_contiguous(ov_list, "ov_list")
-    t1a = _as_real_contiguous(t1a, "t1a")
-    t1a_nz = np.ascontiguousarray(t1a_nz, dtype=np.int32)
+    t1a = np.ascontiguousarray(t1a, dtype=np.int32)
     Ka = np.empty((ncas, ncas, kpair), dtype=np.float64)
     libgbpdft.GBPDFTcontract_alpha_core(
-        ci, conf_info_list, ov_list, t1a, t1a_nz, t1a_nz.shape[0],
+        ci, conf_info_list, ov_list, t1a, t1a.shape[0],
         ncas, na, nb, ngroup, Ka)
     return Ka
 
 
-def _contract_beta_core(ci, conf_info_list, ov_list, t1b, t1b_nz,
-                        ncas, ngroup):
+def _contract_beta_core(ci, conf_info_list, ov_list, t1b, ncas, ngroup):
     """Build the beta active-core contraction tensor with the C backend."""
     na, nb = ci.shape
     kpair = ngroup * ngroup
     ci = _as_real_contiguous(ci, "ci")
     conf_info_list = np.ascontiguousarray(conf_info_list, dtype=np.int32)
     ov_list = _as_real_contiguous(ov_list, "ov_list")
-    t1b = _as_real_contiguous(t1b, "t1b")
-    t1b_nz = np.ascontiguousarray(t1b_nz, dtype=np.int32)
+    t1b = np.ascontiguousarray(t1b, dtype=np.int32)
     Kb = np.empty((ncas, ncas, kpair), dtype=np.float64)
     libgbpdft.GBPDFTcontract_beta_core(
-        ci, conf_info_list, ov_list, t1b, t1b_nz, t1b_nz.shape[0],
+        ci, conf_info_list, ov_list, t1b, t1b.shape[0],
         ncas, na, nb, ngroup, Kb)
     return Kb
 
 
-def _contract_active_pair(ci, conf_info_list, ov_list, t1a, t1b,
-                          t1a_nz, t1b_nz, ncas):
+def _contract_active_pair(ci, conf_info_list, ov_list, t1a, t1b, ncas):
     """Build the active-active opposite-spin tensor with the C backend."""
     na, nb = ci.shape
     ngroup = ov_list.shape[0]
     ci = _as_real_contiguous(ci, "ci")
     conf_info_list = np.ascontiguousarray(conf_info_list, dtype=np.int32)
     ov_list = _as_real_contiguous(ov_list, "ov_list")
-    t1a = _as_real_contiguous(t1a, "t1a")
-    t1b = _as_real_contiguous(t1b, "t1b")
-    t1a_nz = np.ascontiguousarray(t1a_nz, dtype=np.int32)
-    t1b_nz = np.ascontiguousarray(t1b_nz, dtype=np.int32)
+    t1a = np.ascontiguousarray(t1a, dtype=np.int32)
+    t1b = np.ascontiguousarray(t1b, dtype=np.int32)
     out = np.empty((ncas, ncas, ncas, ncas), dtype=np.float64)
     libgbpdft.GBPDFTcontract_active_pair(
-        ci, conf_info_list, ov_list, t1a, t1b,
-        t1a_nz, t1a_nz.shape[0], t1b_nz, t1b_nz.shape[0],
+        ci, conf_info_list, ov_list,
+        t1a, t1a.shape[0], t1b, t1b.shape[0],
         ncas, na, nb, ngroup, out)
     return out
 
@@ -212,8 +205,6 @@ def make_root_intermediates(ci, data):
     ngroup = data["ngroup"]
     t1a = data["t1a"]
     t1b = data["t1b"]
-    t1a_nz = data["t1a_nz"]
-    t1b_nz = data["t1b_nz"]
 
     w_diag = np.abs(ci.reshape(-1))**2
     wgroup = np.bincount(
@@ -223,20 +214,13 @@ def make_root_intermediates(ci, data):
     ci_contig = np.ascontiguousarray(ci)
     conf_info_contig = np.ascontiguousarray(conf_info_list)
     ov_contig = np.ascontiguousarray(ov_list)
-    t1a_contig = np.ascontiguousarray(t1a)
-    t1b_contig = np.ascontiguousarray(t1b)
-    t1a_nz_contig = np.ascontiguousarray(t1a_nz)
-    t1b_nz_contig = np.ascontiguousarray(t1b_nz)
 
     Gamma_ab_ac = _contract_active_pair(
-        ci_contig, conf_info_contig, ov_contig, t1a_contig, t1b_contig,
-        t1a_nz_contig, t1b_nz_contig, ncas)
+        ci_contig, conf_info_contig, ov_contig, t1a, t1b, ncas)
     Ka = _contract_alpha_core(
-        ci_contig, conf_info_contig, ov_contig, t1a_contig,
-        t1a_nz_contig, ncas, ngroup)
+        ci_contig, conf_info_contig, ov_contig, t1a, ncas, ngroup)
     Kb = _contract_beta_core(
-        ci_contig, conf_info_contig, ov_contig, t1b_contig,
-        t1b_nz_contig, ncas, ngroup)
+        ci_contig, conf_info_contig, ov_contig, t1b, ncas, ngroup)
 
     return {
         "wgroup": wgroup,

@@ -2,13 +2,15 @@
 #include <stddef.h>
 
 
+/*
+ * t1a, t1b: signed single excitations, rows [a, i, str1, str0, sign]
+ * t2aa, t2bb: signed double excitations, rows [a2, i2, a1, i1, str2, str0, sign]
+ */
 void gbci_contract_h_spin1(double *erieff, double *ci0, double *ci1,
 int ncas, int nelecasa, int nelecasb,
 int *conf_info_list, int na, uint64_t *stringsa, int nb, uint64_t *stringsb,
-int num, int *t1a, int *t1a_nonzero, int t1a_nonzero_size,
-int *t1b, int *t1b_nonzero, int t1b_nonzero_size,
-int *t2aa, int *t2aa_nonzero, int t2aa_nonzero_size,
-int *t2bb, int *t2bb_nonzero, int t2bb_nonzero_size,
+int num, int *t1a, int t1a_size, int *t1b, int t1b_size,
+int *t2aa, int t2aa_size, int *t2bb, int t2bb_size,
 double *TSc, double *energy_core)
 {
     (void)nelecasa;
@@ -23,17 +25,19 @@ double *TSc, double *energy_core)
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int i = 0; i < t1a_nonzero_size; i++) {
-        const int aa = t1a_nonzero[i*4+0];
-        const int ia = t1a_nonzero[i*4+1];
-        const int str1a = t1a_nonzero[i*4+2];
-        const int str0a = t1a_nonzero[i*4+3];
+    for (int i = 0; i < t1a_size; i++) {
+        const int aa = t1a[i*5+0];
+        const int ia = t1a[i*5+1];
+        const int str1a = t1a[i*5+2];
+        const int str0a = t1a[i*5+3];
+        const int signa = t1a[i*5+4];
 
-        for (int j = 0; j < t1b_nonzero_size; j++) {
-            const int ab = t1b_nonzero[j*4+0];
-            const int ib = t1b_nonzero[j*4+1];
-            const int str1b = t1b_nonzero[j*4+2];
-            const int str0b = t1b_nonzero[j*4+3];
+        for (int j = 0; j < t1b_size; j++) {
+            const int ab = t1b[j*5+0];
+            const int ib = t1b[j*5+1];
+            const int str1b = t1b[j*5+2];
+            const int str0b = t1b[j*5+3];
+            const int signb = t1b[j*5+4];
             const int p1 = conf_info_list[str1a * nb + str1b];
             const int p2 = conf_info_list[str0a * nb + str0b];
 
@@ -45,17 +49,9 @@ double *TSc, double *energy_core)
                 + (size_t)ia * ncas2
                 + (size_t)ab * ncas
                 + ib;
-            const size_t t1a_idx = (size_t)aa * ncas * na * na
-                + (size_t)ia * na * na
-                + (size_t)str1a * na
-                + str0a;
-            const size_t t1b_idx = (size_t)ab * ncas * nb * nb
-                + (size_t)ib * nb * nb
-                + (size_t)str1b * nb
-                + str0b;
 
             const double contrib = ci0[ci0_idx] * erieff[eri_idx]
-                * t1a[t1a_idx] * t1b[t1b_idx]
+                * signa * signb
                 * TSc[p1 * num + p2] * 2.0;
 #ifdef _OPENMP
 #pragma omp atomic
@@ -67,13 +63,14 @@ double *TSc, double *energy_core)
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int i = 0; i < t2aa_nonzero_size; i++) {
-        const int a1 = t2aa_nonzero[i*6+0];
-        const int i1 = t2aa_nonzero[i*6+1];
-        const int a2 = t2aa_nonzero[i*6+2];
-        const int i2 = t2aa_nonzero[i*6+3];
-        const int str1a = t2aa_nonzero[i*6+4];
-        const int str0a = t2aa_nonzero[i*6+5];
+    for (int i = 0; i < t2aa_size; i++) {
+        const int a1 = t2aa[i*7+0];
+        const int i1 = t2aa[i*7+1];
+        const int a2 = t2aa[i*7+2];
+        const int i2 = t2aa[i*7+3];
+        const int str1a = t2aa[i*7+4];
+        const int str0a = t2aa[i*7+5];
+        const int sign = t2aa[i*7+6];
 
         for (int str0b = 0; str0b < nb; str0b++) {
             const int p1 = conf_info_list[str1a * nb + str0b];
@@ -87,15 +84,9 @@ double *TSc, double *energy_core)
                 + (size_t)i1 * ncas2
                 + (size_t)a2 * ncas
                 + i2;
-            const size_t t2aa_idx = (size_t)a1 * ncas * ncas * ncas * na * na
-                + (size_t)i1 * ncas * ncas * na * na
-                + (size_t)a2 * ncas * na * na
-                + (size_t)i2 * na * na
-                + (size_t)str1a * na
-                + str0a;
 
             const double contrib = ci0[ci0_idx] * erieff[eri_idx]
-                * t2aa[t2aa_idx] * TSc[p1 * num + p2];
+                * sign * TSc[p1 * num + p2];
 #ifdef _OPENMP
 #pragma omp atomic
 #endif
@@ -106,13 +97,14 @@ double *TSc, double *energy_core)
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int i = 0; i < t2bb_nonzero_size; i++) {
-        const int a1 = t2bb_nonzero[i*6+0];
-        const int i1 = t2bb_nonzero[i*6+1];
-        const int a2 = t2bb_nonzero[i*6+2];
-        const int i2 = t2bb_nonzero[i*6+3];
-        const int str1b = t2bb_nonzero[i*6+4];
-        const int str0b = t2bb_nonzero[i*6+5];
+    for (int i = 0; i < t2bb_size; i++) {
+        const int a1 = t2bb[i*7+0];
+        const int i1 = t2bb[i*7+1];
+        const int a2 = t2bb[i*7+2];
+        const int i2 = t2bb[i*7+3];
+        const int str1b = t2bb[i*7+4];
+        const int str0b = t2bb[i*7+5];
+        const int sign = t2bb[i*7+6];
 
         for (int str0a = 0; str0a < na; str0a++) {
             const int p1 = conf_info_list[str0a * nb + str1b];
@@ -126,15 +118,9 @@ double *TSc, double *energy_core)
                 + (size_t)i1 * ncas2
                 + (size_t)a2 * ncas
                 + i2;
-            const size_t t2bb_idx = (size_t)a1 * ncas * ncas * ncas * nb * nb
-                + (size_t)i1 * ncas * ncas * nb * nb
-                + (size_t)a2 * ncas * nb * nb
-                + (size_t)i2 * nb * nb
-                + (size_t)str1b * nb
-                + str0b;
 
             const double contrib = ci0[ci0_idx] * erieff[eri_idx]
-                * t2bb[t2bb_idx] * TSc[p1 * num + p2];
+                * sign * TSc[p1 * num + p2];
 #ifdef _OPENMP
 #pragma omp atomic
 #endif

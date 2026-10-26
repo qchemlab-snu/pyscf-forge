@@ -16,7 +16,6 @@ str2occ = direct_gbci.str2occ
 make_hdiag = direct_gbci.make_hdiag
 absorb_h1e = direct_gbci.absorb_h1e
 gen_excitations = direct_gbci.gen_excitations
-gen_nonzero_excitations = direct_gbci.gen_nonzero_excitations
 contract_h = direct_gbci.contract_h
 contract_h_slow = direct_gbci.contract_h_slow
 kernel = direct_gbci.kernel
@@ -32,7 +31,7 @@ contract_H_slow = contract_h_slow
 
 __all__ = [
     "str2occ", "make_hdiag", "absorb_h1e",
-    "gen_excitations", "gen_nonzero_excitations",
+    "gen_excitations",
     "contract_h", "contract_h_slow", "contract_H", "contract_H_slow",
     "kernel", "fix_spin", "fix_spin_",
     "GBCISolver", "SpinPenaltyGBCISolver",
