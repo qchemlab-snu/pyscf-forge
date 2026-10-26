@@ -96,6 +96,11 @@ def absorb_h1e(h1e, eri, ncas, nelecas, fac=1):
         erieff[:,:,:,:,k,k] += f1e
     return erieff * fac
 
+# contract_h splits each excitation list into SIGMA_CHUNKS fixed ranges with a
+# private accumulator each (SIGMA_CHUNKS copies of the CI vector), so the result
+# does not depend on the number of threads
+SIGMA_CHUNKS = 32
+
 def _link_entries(link_index):
     link_index = numpy.asarray(link_index)
     nstr, nlink = link_index.shape[:2]
@@ -107,8 +112,7 @@ def gen_single_excitation_list(link_index):
     '''Signed single excitations E_ai of one spin string space.
 
     Returns (n1, 5) int32, rows [a, i, str1, str0, sign] for
-    str1 = E_ai str0, ordered as numpy.nonzero orders the dense table
-    t1[a,i,str1,str0].
+    str1 = E_ai str0, sorted by (a, i, str1, str0).
     '''
     a1, i1, str1, str0, sign1 = _link_entries(link_index)
     order = numpy.lexsort((str0, str1, i1, a1))
@@ -121,8 +125,7 @@ def gen_excitation_list(link_index):
     Returns
         t1 : see gen_single_excitation_list
         t2 : (n2, 7) int32, rows [a2, i2, a1, i1, str2, str0, sign] for
-             str2 = E_a2i2 E_a1i1 str0, ordered as numpy.nonzero orders the
-             dense table t2[a2,i2,a1,i1,str2,str0].
+             str2 = E_a2i2 E_a1i1 str0, sorted by (a2, i2, a1, i1, str2, str0).
     '''
     link_index = numpy.asarray(link_index)
     nlink = link_index.shape[1]
@@ -180,6 +183,7 @@ def contract_h(erieff, civec, ncas, nelecas, conf_info_list, ov_list, ecore_list
     ov_list = numpy.asarray(ov_list, order = 'C', dtype=numpy.float64)
     ecore_list = numpy.asarray(ecore_list, order = 'C', dtype=numpy.float64)
     mo_num = erieff.shape[0]
+    buf = numpy.zeros((SIGMA_CHUNKS,) + civec.shape)
     libgbci.gbci_contract_h_spin1(erieff.ctypes.data_as(ctypes.c_void_p),
          civec.ctypes.data_as(ctypes.c_void_p),
          cinew.ctypes.data_as(ctypes.c_void_p),
@@ -193,7 +197,8 @@ def contract_h(erieff, civec, ncas, nelecas, conf_info_list, ov_list, ecore_list
          t1b.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(t1b.shape[0]),
          t2aa.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(t2aa.shape[0]),
          t2bb.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(t2bb.shape[0]),
-         ov_list.ctypes.data_as(ctypes.c_void_p), ecore_list.ctypes.data_as(ctypes.c_void_p))
+         ov_list.ctypes.data_as(ctypes.c_void_p), ecore_list.ctypes.data_as(ctypes.c_void_p),
+         ctypes.c_int(SIGMA_CHUNKS), buf.ctypes.data_as(ctypes.c_void_p))
     return cinew
 
 def contract_h_slow(erieff, civec, ncas, nelecas, conf_info_list, ov_list, ecore_list, link_index=None):
