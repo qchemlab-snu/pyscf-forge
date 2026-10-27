@@ -613,16 +613,43 @@ def h1e_for_gbci(gbci, dmet_act_list=None, mo_list=None, dmet_core_list=None,
     energy_nuc = gbci.energy_nuc()
     ha1e = lib.einsum('ai,ab,bj->ij',mo_cas,hcore,mo_cas)
 
-    for i in range(0,p):
-        for j in range(0,p):
-            if i >= j:
-                corevhf = gbci.get_veff(dm = 2*dmet_core_list[i,j],hermi = 0)
-                h1e[i,j] = ha1e + lib.einsum('ijab,ba -> ij', dmet_act_list , corevhf)
-                h1e[j,i] = h1e[i,j].T
-            if i==j:
-                ecore_list[i] += lib.einsum('ab,ab -> ', dmet_core_list[i,i],corevhf)
-                ecore_list[i] += energy_nuc
-                ecore_list[i] += 2*lib.einsum('ab,ab->', dmet_core_list[i,i], hcore)
+    # h1e[i,j,t,u] = ha1e[t,u] + <dmet_act_list[t,u]^T, veff(2 D_ij)>. veff is
+    # linear and <X, veff(Y)> = <Y, veff(X)>, so this equals
+    # <2 D_ij, veff(dmet_act_list[t,u]^T)>: ncas**2 J/K builds serve all bath
+    # pairs, which are then one GEMM, instead of one build per pair.
+    nao = dmet_core_list.shape[-1]
+    avail = max(gbci.max_memory - lib.current_memory()[0], 1000) * 1e6 * .2
+    per_dm = nao * nao * 8. * (2 + lib.num_threads())
+    nact = ncas * ncas
+    act_dm = numpy.asarray(dmet_act_list).reshape(nact, nao, nao)
+    vact = numpy.empty((nact, nao * nao))
+    chunk = max(1, min(nact, int(avail / per_dm)))
+    for k0 in range(0, nact, chunk):
+        k1 = min(k0 + chunk, nact)
+        dms = numpy.asarray(act_dm[k0:k1].transpose(0, 2, 1), order='C')
+        vact[k0:k1] = numpy.asarray(
+            gbci.get_veff(dm=dms, hermi=0)).reshape(k1 - k0, -1)
+    vact *= 2
+
+    pair_i, pair_j = numpy.tril_indices(p)
+    rows = max(1, min(len(pair_i), int(avail / (3. * nao * nao * 8.))))
+    for k0 in range(0, len(pair_i), rows):
+        bi = pair_i[k0:k0+rows]
+        bj = pair_j[k0:k0+rows]
+        dm = numpy.asarray(dmet_core_list[bi, bj]).reshape(len(bi), -1)
+        blk = (dm @ vact.T).reshape(len(bi), ncas, ncas) + ha1e
+        h1e[bi, bj] = blk
+        h1e[bj, bi] = blk.transpose(0, 2, 1)
+
+    # the core energies need <D_ii, veff(2 D_ii)>, one build per bath
+    step = max(1, min(p, int(avail / per_dm)))
+    for k0 in range(0, p, step):
+        d = numpy.arange(k0, min(k0 + step, p))
+        core = numpy.asarray(dmet_core_list[d, d])
+        corevhf = numpy.asarray(gbci.get_veff(dm=2*core, hermi=0))
+        ecore_list[d] += lib.einsum('xab,xab->x', core, corevhf)
+        ecore_list[d] += energy_nuc
+        ecore_list[d] += 2*lib.einsum('xab,ab->x', core, hcore)
     gbci.h1e = h1e
     gbci.core_energies = ecore_list
     return h1e, ecore_list
