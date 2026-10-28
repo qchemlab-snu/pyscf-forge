@@ -585,6 +585,38 @@ def optimize_mo(gbci, mo_coeff=None, ncas=None, nelecas=None, ncore=None,
 
     return optimized_mo, optimized_mo_energy, po_list, group
 
+def _veff_act_mo(gbci, mo, ncore, ncas):
+    '''veff(X_ut)[p,q] in the MO basis, X_ut = phi_u phi_t^T, as (nmo**2, ncas**2):
+    (pq|tu) - 1/2 (pu|tq) from ppaa[p,q,t,u] = (pq|tu), papa[p,t,q,u] = (pt|qu).'''
+    from pyscf.mcscf import mc_ao2mo
+    eri = gbci._scf._eri
+    if eri is not None:
+        ppaa, papa = mc_ao2mo.trans_e1_incore(eri, mo, ncore, ncas)[2:]
+    else:
+        feri = lib.H5TmpFile()
+        max_memory = max(3000, gbci.max_memory * .9 - lib.current_memory()[0])
+        mc_ao2mo.trans_e1_outcore(gbci.mol, mo, ncore, ncas, feri,
+                                  max_memory=max_memory, level=2)
+        ppaa, papa = feri['ppaa'], feri['papa']
+    w = numpy.asarray(ppaa)
+    w -= .5 * numpy.asarray(papa).transpose(0, 2, 3, 1)
+    nmo = mo.shape[1]
+    return w.reshape(nmo * nmo, ncas * ncas)
+
+def _veff_act_ao(gbci, dmet_act_list, ncas, avail, per_dm):
+    '''veff(X_ut) in the AO basis from J/K builds, as (nao**2, ncas**2).'''
+    nact = ncas * ncas
+    nao = dmet_act_list.shape[-1]
+    act_dm = numpy.asarray(dmet_act_list).reshape(nact, nao, nao)
+    vact = numpy.empty((nact, nao * nao))
+    chunk = max(1, min(nact, int(avail / per_dm)))
+    for k0 in range(0, nact, chunk):
+        k1 = min(k0 + chunk, nact)
+        dms = numpy.asarray(act_dm[k0:k1].transpose(0, 2, 1), order='C')
+        vact[k0:k1] = numpy.asarray(
+            gbci.get_veff(dm=dms, hermi=0)).reshape(k1 - k0, -1)
+    return vact.T.copy()
+
 def h1e_for_gbci(gbci, dmet_act_list=None, mo_list=None, dmet_core_list=None,
                    ncas=None, ncore=None):
     ''' GBCI space one-electron hamiltonian
@@ -615,20 +647,22 @@ def h1e_for_gbci(gbci, dmet_act_list=None, mo_list=None, dmet_core_list=None,
 
     # h1e[i,j,t,u] = ha1e[t,u] + <dmet_act_list[t,u]^T, veff(2 D_ij)>. veff is
     # linear and <X, veff(Y)> = <Y, veff(X)>, so this equals
-    # <2 D_ij, veff(dmet_act_list[t,u]^T)>: ncas**2 J/K builds serve all bath
-    # pairs, which are then one GEMM, instead of one build per pair.
+    # <2 D_ij, veff(dmet_act_list[t,u]^T)>: one table veff(X_ut) serves all
+    # bath pairs, which are then one GEMM, instead of one J/K build per pair.
     nao = dmet_core_list.shape[-1]
     avail = max(gbci.max_memory - lib.current_memory()[0], 1000) * 1e6 * .2
     per_dm = nao * nao * 8. * (2 + lib.num_threads())
-    nact = ncas * ncas
-    act_dm = numpy.asarray(dmet_act_list).reshape(nact, nao, nao)
-    vact = numpy.empty((nact, nao * nao))
-    chunk = max(1, min(nact, int(avail / per_dm)))
-    for k0 in range(0, nact, chunk):
-        k1 = min(k0 + chunk, nact)
-        dms = numpy.asarray(act_dm[k0:k1].transpose(0, 2, 1), order='C')
-        vact[k0:k1] = numpy.asarray(
-            gbci.get_veff(dm=dms, hermi=0)).reshape(k1 - k0, -1)
+    if getattr(gbci._scf, 'with_df', None) is None:
+        # The table from the CASSCF integral transformation, in the MO basis
+        # of mo_list[0]; D_ij lies in that span, so <D, W> = <C^T S D S C, W'>.
+        mo = numpy.asarray(mo_list[0])
+        vact = _veff_act_mo(gbci, mo, ncore, ncas)
+        sc = gbci._scf.get_ovlp() @ mo
+        nbas = mo.shape[1]
+    else:
+        vact = _veff_act_ao(gbci, dmet_act_list, ncas, avail, per_dm)
+        sc = None
+        nbas = nao
     vact *= 2
 
     pair_i, pair_j = numpy.tril_indices(p)
@@ -636,17 +670,22 @@ def h1e_for_gbci(gbci, dmet_act_list=None, mo_list=None, dmet_core_list=None,
     for k0 in range(0, len(pair_i), rows):
         bi = pair_i[k0:k0+rows]
         bj = pair_j[k0:k0+rows]
-        dm = numpy.asarray(dmet_core_list[bi, bj]).reshape(len(bi), -1)
-        blk = (dm @ vact.T).reshape(len(bi), ncas, ncas) + ha1e
+        dm = numpy.asarray(dmet_core_list[bi, bj])
+        if sc is not None:
+            dm = lib.einsum('ap,xab,bq->xpq', sc, dm, sc)
+        dm = dm.reshape(len(bi), nbas * nbas)
+        blk = (dm @ vact).reshape(len(bi), ncas, ncas) + ha1e
         h1e[bi, bj] = blk
         h1e[bj, bi] = blk.transpose(0, 2, 1)
 
-    # the core energies need <D_ii, veff(2 D_ii)>, one build per bath
+    # the core energies need <D_ii, veff(2 D_ii)>, one build per bath. D_ii =
+    # C A^-1 C^T with A = C^T S C, so it is symmetric up to rounding.
     step = max(1, min(p, int(avail / per_dm)))
     for k0 in range(0, p, step):
         d = numpy.arange(k0, min(k0 + step, p))
         core = numpy.asarray(dmet_core_list[d, d])
-        corevhf = numpy.asarray(gbci.get_veff(dm=2*core, hermi=0))
+        core = .5 * (core + core.transpose(0, 2, 1))
+        corevhf = numpy.asarray(gbci.get_veff(dm=2*core, hermi=1))
         ecore_list[d] += lib.einsum('xab,xab->x', core, corevhf)
         ecore_list[d] += energy_nuc
         ecore_list[d] += 2*lib.einsum('xab,ab->x', core, hcore)
