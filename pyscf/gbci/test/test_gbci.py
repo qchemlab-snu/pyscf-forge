@@ -259,6 +259,28 @@ class KnownValues(unittest.TestCase):
                     ov_list, ecore_list)
                 np.testing.assert_allclose(fast, slow, atol=1e-10)
 
+    def test_h1e_outcore_matches_incore(self):
+        for label, group_a in RDM_CASES:
+            with self.subTest(group_a=label):
+                mf = build_lih_mf()
+                mc = track_mc(gbci.gbci(mf, 2, (1, 1), group_a=group_a))
+                mc.mo_coeff = mf.mo_coeff
+                intermediates = mc.get_gbci_intermediates()
+                kwargs = {
+                    "dmet_act_list": mc.get_active_dm(mc.mo_coeff),
+                    "mo_list": intermediates["mo_list"],
+                    "dmet_core_list": intermediates["dmet_core_list"],
+                }
+                self.assertIsNotNone(mf._eri)
+                h1e_in, ecore_in = mc.get_h1cas(**kwargs)
+                eri, mf._eri = mf._eri, None
+                try:
+                    h1e_out, ecore_out = mc.get_h1cas(**kwargs)
+                finally:
+                    mf._eri = eri
+                np.testing.assert_allclose(h1e_out, h1e_in, atol=1e-10)
+                np.testing.assert_allclose(ecore_out, ecore_in, atol=1e-10)
+
     def test_sfnoci_aliases(self):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
