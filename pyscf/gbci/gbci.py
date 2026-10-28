@@ -585,23 +585,114 @@ def optimize_mo(gbci, mo_coeff=None, ncas=None, nelecas=None, ncore=None,
 
     return optimized_mo, optimized_mo_energy, po_list, group
 
-def _veff_act_mo(gbci, mo, ncore, ncas):
+def _ao2mo_core(mol, mo, ncore, ncas, dcore, max_memory):
+    '''ppaa and papa as mc_ao2mo.trans_e1_outcore (level 2) builds them, and
+    <D_i, veff(2 D_i)> for the symmetric core densities dcore, from the same
+    screened s4 integral buffer:
+    2 sum D_la (la|bs) D_bs - sum D_ls (la|bs) D_ab.'''
+    from pyscf.ao2mo import _ao2mo, outcore
+    nao, nmo = mo.shape
+    nao_pair = nao * (nao + 1) // 2
+    nocc = ncore + ncas
+    p = dcore.shape[0]
+    mo = numpy.asarray(mo, order='F')
+    pashape = (0, nmo, ncore, nocc)
+    papa_buf = numpy.zeros((nao, ncas, nmo * ncas))
+    faa = numpy.empty((ncas * ncas, nao_pair))
+    dpack = lib.pack_tril(dcore * (2 - numpy.eye(nao))).T.copy()
+    dt = numpy.asarray(dcore.transpose(1, 2, 0), order='C')
+    ej = numpy.zeros(p)
+    ek = numpy.zeros(p)
+    kblk = 64
+    used = (papa_buf.nbytes + faa.nbytes + dpack.nbytes + dt.nbytes
+            + kblk * nao * nao * 8 * 2) / 1e6
+    mem_words = int(max(2000, max_memory - used) * 1e6 / 8)
+    aobuflen = mem_words // (nao_pair + nocc * nmo) + 1
+    ao_loc = numpy.array(mol.ao_loc_nr(), dtype=numpy.int32)
+    shranges = outcore.guess_shell_ranges(mol, True, aobuflen, None, ao_loc)
+    intor = mol._add_suffix('int2e')
+    ao2mopt = _ao2mo.AO2MOpt(mol, intor, 'CVHFnr_schwarz_cond',
+                             'CVHFsetnr_direct_scf')
+    maxbuflen = max(x[2] for x in shranges)
+    bufs1 = numpy.empty((maxbuflen, nao_pair))
+    bufs2 = numpy.empty((maxbuflen, nmo * ncas))
+    full = numpy.empty((kblk, nao, nao))
+    row0 = 0
+    for sh_range in shranges:
+        nrow = sh_range[2]
+        buf = bufs1[:nrow]
+        _ao2mo.nr_e1fill(intor, sh_range, mol._atm, mol._bas, mol._env,
+                         's4', 1, ao2mopt, buf)
+        bufpa = bufs2[:nrow]
+        _ao2mo.nr_e1(buf, mo, pashape, 's4', 's1', out=bufpa)
+        faa[:, row0:row0+nrow] = \
+            bufpa.reshape(nrow, nmo, ncas)[:, ncore:nocc].reshape(-1, ncas**2).T
+        row0 += nrow
+        # bra AO pair (l, a) of every row, weight 2 for l != a
+        lam, a, w = [], [], []
+        p0 = 0
+        for ij in range(sh_range[0], sh_range[1]):
+            i, j = lib.index_tril_to_pair(ij)
+            i0, i1, j0, j1 = ao_loc[i], ao_loc[i+1], ao_loc[j], ao_loc[j+1]
+            di, dj = i1 - i0, j1 - j0
+            if i == j:
+                dij = di * (di + 1) // 2
+                idx = numpy.tril_indices(di)
+                buf1 = numpy.empty((di, di, nmo * ncas))
+                buf1[idx] = bufpa[p0:p0+dij]
+                buf1[idx[1], idx[0]] = bufpa[p0:p0+dij]
+                lam.append(idx[0] + i0)
+                a.append(idx[1] + i0)
+                w.append(numpy.where(idx[0] == idx[1], 1., 2.))
+            else:
+                dij = di * dj
+                buf1 = bufpa[p0:p0+dij].reshape(di, dj, -1)
+                mo1 = mo[j0:j1, ncore:nocc].copy()
+                for k in range(di):
+                    lib.dot(mo1.T, buf1[k], 1, papa_buf[i0+k], 1)
+                lam.append(numpy.repeat(numpy.arange(i0, i1), dj))
+                a.append(numpy.tile(numpy.arange(j0, j1), di))
+                w.append(numpy.full(dij, 2.))
+            mo1 = mo[i0:i1, ncore:nocc].copy()
+            buf1 = lib.dot(mo1.T, buf1.reshape(di, -1))
+            papa_buf[j0:j1] += buf1.reshape(ncas, dj, -1).transpose(1, 0, 2)
+            p0 += dij
+        lam = numpy.concatenate(lam)
+        a = numpy.concatenate(a)
+        w = numpy.concatenate(w)
+        ej += numpy.einsum('x,xp,xp->p', w, buf @ dpack, dt[lam, a])
+        for k0 in range(0, nrow, kblk):
+            k1 = min(k0 + kblk, nrow)
+            f = full[:k1-k0]
+            lib.unpack_tril(buf[k0:k1], out=f)
+            z = numpy.matmul(f, dt[lam[k0:k1]])
+            ek += numpy.einsum('x,xbp,xbp->p', w[k0:k1], z, dt[a[k0:k1]])
+    buf = bufs1 = bufs2 = bufpa = full = None
+
+    papa = lib.dot(mo.T, papa_buf.reshape(nao, -1)).reshape(nmo, ncas, nmo, ncas)
+    papa_buf = None
+    aapp = _ao2mo.nr_e2(faa, mo, (0, nmo, 0, nmo), 's4', 's1', ao_loc=ao_loc)
+    ppaa = lib.transpose(aapp.reshape(ncas * ncas, -1)).reshape(nmo, nmo, ncas, ncas)
+    return ppaa, papa, 2 * ej - ek
+
+def _veff_act_mo(gbci, mo, ncore, ncas, dcore):
     '''veff(X_ut)[p,q] in the MO basis, X_ut = phi_u phi_t^T, as (nmo**2, ncas**2):
-    (pq|tu) - 1/2 (pu|tq) from ppaa[p,q,t,u] = (pq|tu), papa[p,t,q,u] = (pt|qu).'''
-    from pyscf.mcscf import mc_ao2mo
+    (pq|tu) - 1/2 (pu|tq) from ppaa[p,q,t,u] = (pq|tu), papa[p,t,q,u] = (pt|qu).
+    Without in-core integrals, <D_i, veff(2 D_i)> of the core densities comes
+    from the same integral pass; otherwise the second value is None.'''
     eri = gbci._scf._eri
     if eri is not None:
+        from pyscf.mcscf import mc_ao2mo
         ppaa, papa = mc_ao2mo.trans_e1_incore(eri, mo, ncore, ncas)[2:]
+        ecc = None
     else:
-        feri = lib.H5TmpFile()
         max_memory = max(3000, gbci.max_memory * .9 - lib.current_memory()[0])
-        mc_ao2mo.trans_e1_outcore(gbci.mol, mo, ncore, ncas, feri,
-                                  max_memory=max_memory, level=2)
-        ppaa, papa = feri['ppaa'], feri['papa']
+        ppaa, papa, ecc = _ao2mo_core(gbci.mol, mo, ncore, ncas, dcore,
+                                      max_memory)
     w = numpy.asarray(ppaa)
     w -= .5 * numpy.asarray(papa).transpose(0, 2, 3, 1)
     nmo = mo.shape[1]
-    return w.reshape(nmo * nmo, ncas * ncas)
+    return w.reshape(nmo * nmo, ncas * ncas), ecc
 
 def _veff_act_ao(gbci, dmet_act_list, ncas, avail, per_dm):
     '''veff(X_ut) in the AO basis from J/K builds, as (nao**2, ncas**2).'''
@@ -652,15 +743,19 @@ def h1e_for_gbci(gbci, dmet_act_list=None, mo_list=None, dmet_core_list=None,
     nao = dmet_core_list.shape[-1]
     avail = max(gbci.max_memory - lib.current_memory()[0], 1000) * 1e6 * .2
     per_dm = nao * nao * 8. * (2 + lib.num_threads())
+    # D_ii = C A^-1 C^T with A = C^T S C, so it is symmetric up to rounding
+    dcore = numpy.asarray(dmet_core_list[numpy.arange(p), numpy.arange(p)])
+    dcore = .5 * (dcore + dcore.transpose(0, 2, 1))
     if getattr(gbci._scf, 'with_df', None) is None:
         # The table from the CASSCF integral transformation, in the MO basis
         # of mo_list[0]; D_ij lies in that span, so <D, W> = <C^T S D S C, W'>.
         mo = numpy.asarray(mo_list[0])
-        vact = _veff_act_mo(gbci, mo, ncore, ncas)
+        vact, ecc = _veff_act_mo(gbci, mo, ncore, ncas, dcore)
         sc = gbci._scf.get_ovlp() @ mo
         nbas = mo.shape[1]
     else:
         vact = _veff_act_ao(gbci, dmet_act_list, ncas, avail, per_dm)
+        ecc = None
         sc = None
         nbas = nao
     vact *= 2
@@ -678,17 +773,17 @@ def h1e_for_gbci(gbci, dmet_act_list=None, mo_list=None, dmet_core_list=None,
         h1e[bi, bj] = blk
         h1e[bj, bi] = blk.transpose(0, 2, 1)
 
-    # the core energies need <D_ii, veff(2 D_ii)>, one build per bath. D_ii =
-    # C A^-1 C^T with A = C^T S C, so it is symmetric up to rounding.
-    step = max(1, min(p, int(avail / per_dm)))
-    for k0 in range(0, p, step):
-        d = numpy.arange(k0, min(k0 + step, p))
-        core = numpy.asarray(dmet_core_list[d, d])
-        core = .5 * (core + core.transpose(0, 2, 1))
-        corevhf = numpy.asarray(gbci.get_veff(dm=2*core, hermi=1))
-        ecore_list[d] += lib.einsum('xab,xab->x', core, corevhf)
-        ecore_list[d] += energy_nuc
-        ecore_list[d] += 2*lib.einsum('xab,ab->x', core, hcore)
+    # the core energies need <D_ii, veff(2 D_ii)>; without the integral pass
+    # above, one J/K build per bath
+    if ecc is None:
+        ecc = numpy.empty(p)
+        step = max(1, min(p, int(avail / per_dm)))
+        for k0 in range(0, p, step):
+            core = dcore[k0:k0+step]
+            corevhf = numpy.asarray(gbci.get_veff(dm=2*core, hermi=1))
+            ecc[k0:k0+step] = lib.einsum('xab,xab->x', core, corevhf)
+    ecore_list += ecc + energy_nuc
+    ecore_list += 2*lib.einsum('xab,ab->x', dcore, hcore)
     gbci.h1e = h1e
     gbci.core_energies = ecore_list
     return h1e, ecore_list
