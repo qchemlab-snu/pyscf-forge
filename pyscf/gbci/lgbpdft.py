@@ -197,9 +197,8 @@ def kernel(mc, ci_list, mo_coeff=None, ot=None, intermediates=None,
     grid = _Grid(mc, ot, mo_coeff, otpd_data, vecs, mc.max_memory, ontop)
     dm = [d[0] + d[1] for d in grid.dm1s]
 
-    ctx = gbsrpdft._Context(mc, mo_coeff, inter, gbsrpdft.DEFAULT_OMEGA,
-                            "screened")
-    hmat = gbsrpdft.hamiltonian_matrix(mc, ctx.ham_full(), inter, ci)
+    hmat = gbsrpdft.hamiltonian_matrix(
+        mc, gbsrpdft.full_hamiltonian(mc, mo_coeff, inter), inter, ci)
     hcore = mc._scf.get_hcore()
     enuc = mc._scf.energy_nuc()
 

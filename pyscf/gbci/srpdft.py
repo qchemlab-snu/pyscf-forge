@@ -10,13 +10,12 @@
 
 The short-range functional (erf-attenuated PBE) takes its spin polarization
 from the on-top pair density, as in MC-srPDFT (Jensen et al., JCP 162,
-034104 (2025)), with the tPBE translation
+034104 (2025)), by the translation of the t (tPBE-type) on-top functionals:
 
-    zeta(r)^2 = u(r) = 1 - 4 Pi(r) / rho(r)^2 ,
+    zeta(r) = sqrt(1 - R),  R = 4 Pi(r) / rho(r)^2   for R < 1,
+    zeta(r) = 0                                       for R >= 1.
 
-screened: where u < 0 (R = 4 Pi / rho^2 > 1) the density is treated as
-unpolarized (u = 0); where u > 1 (Pi < 0, numerical noise in the tails) it
-is fully polarized (u = 1).
+Only this translation is available (no fully translated, ft, form).
 '''
 
 import numpy as np
@@ -99,12 +98,12 @@ def ratio_from_pair_density(rho, Pi, tol=1e-12):
 
 
 def exc_ontop(fnal, rho, u, omega=None, report=None):
-    '''Exchange-correlation energy per particle at the screened on-top
+    '''Exchange-correlation energy per particle at the translated on-top
     polarization.
 
     ``rho`` is ``(4, N)`` in PySCF's GGA layout and spin summed; ``u`` is
-    ``1 - 4 Pi / rho^2`` per point.  u is clipped to [0, 1] (screening) and
-    libxc is called at zeta = sqrt(u).  Points where the spin-polarized libxc
+    ``1 - 4 Pi / rho^2`` per point.  u is clipped to [0, 1] and libxc is
+    called at zeta = sqrt(u).  Points where the spin-polarized libxc
     call stays non-finite fall back to the unpolarized value; ``report``
     counts them (``n_unpolarized_fallback``, ``fallback_mask``).
     '''

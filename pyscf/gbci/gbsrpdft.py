@@ -35,8 +35,9 @@ off the diagonal and the state-specific expression of Theta_I on it:
 ``*_gbci`` kernels use the GB-srPDFT diagonal, ``*_xms`` / ``*_gbpdft``
 kernels the GB-PDFT diagonal of an on-top functional (e.g. tPBE0).
 
-The short-range functional uses the screened tPBE translation
-(`pyscf.gbci.srpdft`).
+The short-range functional uses the translation of the t (tPBE-type)
+on-top functionals (`pyscf.gbci.srpdft`); only that translation is
+available.
 '''
 
 import numpy as np
@@ -104,10 +105,10 @@ def sr_hxc_energy_ontop(mc, dm1, ci, otpd_data, omega=DEFAULT_OMEGA,
                         ontop="exact", dm1s=None):
     """Short-range Hartree + xc energy with the spin polarization from Pi.
 
-    Screened translation (`pyscf.gbci.srpdft`): wherever R = 4 Pi / rho^2
-    > 1 the density is treated as unpolarized.  ``report``, if given,
-    collects the density screened (``electrons_screened``), saturated
-    (Pi < 0) and evaluated unpolarized after a libxc failure.
+    t translation (`pyscf.gbci.srpdft`): zeta = 0 wherever R = 4 Pi / rho^2
+    >= 1.  ``report``, if given, collects the density with R > 1
+    (``electrons_unpolarized``), with Pi < 0 (``electrons_saturated``) and
+    evaluated unpolarized after a libxc failure (``electrons_fallback``).
 
     ``ontop="cas_cumulant"``: Pi = rho_a rho_b + active CAS cumulant (as
     ``otpd.energy_ot``), rho_a, rho_b from ``dm1s`` (dm1 / 2 each when not
@@ -158,8 +159,8 @@ def sr_hxc_energy_ontop(mc, dm1, ci, otpd_data, omega=DEFAULT_OMEGA,
                 mc, ao, np.asarray(ci).real, otpd_data, mo_coeff, 0, mask,
                 ot_root_cache=ot_root_cache)).ravel()
         u = srpdft.ratio_from_pair_density(rho[0], Pi)
-        # a closed-shell core sits at u = 0 up to noise; count only the
-        # density the screening changes (R > 1.01) and the saturated tails
+        # a closed-shell core sits at u = 0 up to noise; count only R > 1.01
+        # and the Pi < 0 tails
         scr, hi = u < -0.01, u > 1.0
         if scr.any():
             rho_scr += float(np.dot(rho[0][scr], weight[scr]))
@@ -181,7 +182,7 @@ def sr_hxc_energy_ontop(mc, dm1, ci, otpd_data, omega=DEFAULT_OMEGA,
         report["electrons_saturated"] = rho_sat
         report["n_fallback"] = n_fb
         report["electrons_fallback"] = rho_fb
-        report["electrons_screened"] = rho_scr
+        report["electrons_unpolarized"] = rho_scr
     return e
 
 
