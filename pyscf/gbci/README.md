@@ -76,6 +76,39 @@ gbci.gbci(mf, 2, (1, 1), group_a={"atom": [[0], [1]]})
 gbci.gbci(mf, 2, (1, 1), group_a={"occ": [[0], [1], [2]]})
 ```
 
+## Solvers
+
+Bath orbitals (FASSCF).  `mixed_routine` first runs the EDIIS + DIIS
+solver (`FASSCF.ediis_kernel`, Kudin, Scuseria and Cances, J. Chem. Phys.
+116, 8255 (2002)).  `optimize_mo` solves all baths of a GBCI run with it in
+lockstep (`ediis_kernel_many`: one batched `get_jk` call per step).  A
+converged bath is checked for a negative orbital-Hessian eigenvalue; at a
+saddle point a step along that mode and a new EDIIS stage follow.  Baths that
+EDIIS does not converge go through the damped iterations and Newton SOSCF as
+before.  With `conv_tol_grad = None` EDIIS converges the bath gradient to
+`1e-3 sqrt(conv_tol)`, not below 1e-8 (DIIS converges fast near the
+solution); quantities that are linear in the bath orbitals (XMS energies,
+nuclear gradients) then do not depend on the solver path.  Options:
+
+```python
+mc._fasscf.mixed_routine_options = {"ediis": False}   # previous solver only
+mc._fasscf.ediis_switch = 0.1         # EDIIS -> DIIS on max |FP - PF|
+mc._fasscf.ediis_occupation = "aufbau"  # or "mom", "imom"
+mc._fasscf.max_stability = 5          # 0: no stability check
+mc._fasscf.stability_tol = 1e-4
+```
+
+CI solver (`GBCISolver`).  H|CI> is computed by the libgbci kernel over the
+signed excitation lists (`sigma_kernel = "contract_h"`); `"block"` computes it
+by group blocks with the PySCF FCI kernels, which is slower for large active
+spaces.  The Davidson solver uses the exact Hamiltonian on
+a pspace block of `pspace_size` determinants (completed to whole
+spin-coupling sets, with the `fix_spin_` penalty) as preconditioner and guess
+(generalized Davidson); spaces of at most `pspace_size` determinants are
+diagonalized directly unless `davidson_only`.  `pspace_size = 0` gives the
+diagonal preconditioner.  `guess_noise` (1e-3) adds a random part of that
+norm to the guess vectors.
+
 ## GBPDFT Usage
 
 Import the GBPDFT module from `pyscf.gbci`:

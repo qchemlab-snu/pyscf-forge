@@ -53,6 +53,27 @@ def _as_ci_list(ci):
     return [ci]
 
 
+def _reshape_ci0_like_ci(ci, ci0):
+    """Return ci0 with per-root shapes compatible with ci when possible."""
+    if ci0 is None:
+        return None
+    ci_list = _as_ci_list(ci)
+    ci0_list = _as_ci_list(ci0)
+    if len(ci_list) != len(ci0_list):
+        return ci0
+
+    reshaped = []
+    changed = False
+    for ci_root, ci0_root in zip(ci_list, ci0_list):
+        ref = np.asarray(ci_root)
+        guess = np.asarray(ci0_root)
+        if guess.shape != ref.shape and guess.size == ref.size:
+            guess = guess.reshape(ref.shape)
+            changed = True
+        reshaped.append(guess)
+    return reshaped if changed else ci0
+
+
 def _contract_hamiltonian(solver, erieff, civec, ncas, nelecas,
                           conf_info_list, ov_list, ecore_list, link_index,
                           ts):
@@ -174,6 +195,12 @@ class _MSGBPDFT(mspdft._MSPDFT):
 
     def optimize_mcscf_(self, mo_coeff=None, ci0=None, **kwargs):
         return self.optimize_gbci_(mo_coeff=mo_coeff, ci0=ci0, **kwargs)
+
+    def diabatize(self, ci=None, ci0=None, **kwargs):
+        if ci is None:
+            ci = self.ci
+        ci0 = _reshape_ci0_like_ci(ci, ci0)
+        return super().diabatize(ci=ci, ci0=ci0, **kwargs)
 
     def compute_pdft_energy_(self, *args, **kwargs):
         old_e_gbci = self.e_gbci
