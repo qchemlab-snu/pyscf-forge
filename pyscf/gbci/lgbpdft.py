@@ -4,7 +4,8 @@
 #
 # Licensed under the Apache License, Version 2.0
 #
-# Author: Minseok Oh <msjeff2001@snu.ac.kr>
+# Author: Byungjoo Kim <creeperkim28@snu.ac.kr>
+#         Minseok Oh <msjeff2001@snu.ac.kr>
 #
 
 '''
