@@ -79,36 +79,13 @@ def _uncached_range_coulomb(mc, omega):
     return _ctx()
 
 
-def _assert_sr_finite(omega, xc, x_fnal, sr_scale, **arrays):
-    """Raise where a non-finite short-range energy is made."""
-    for name, a in arrays.items():
-        arr = np.asarray(a, dtype=float)
-        if not np.isfinite(arr).all():
-            raise RuntimeError(
-                "short-range %s is not finite at omega=%.3f: %d of %d entries "
-                "(xc=%s, x_fnal=%s, sr_scale=%g)"
-                % (name, omega, int((~np.isfinite(arr)).sum()), arr.size,
-                   xc, x_fnal, sr_scale))
-
-
-def _clear_gbci_intermediates(mc):
-    """Drop the cached GBCI intermediates (their cache key does not see the
-    Hamiltonian, e.g. a range-separated one)."""
-    if hasattr(mc, "_gbci_intermediates_cache"):
-        mc._gbci_intermediates = None
-        mc._gbci_intermediates_cache = None
-
-
 def sr_hxc_energy_ontop(mc, dm1, ci, otpd_data, omega=DEFAULT_OMEGA,
                         xc=DEFAULT_SR_C, x_fnal=DEFAULT_SR_X, grids=None,
-                        mo_coeff=None, ot_root_cache=None, report=None,
-                        ontop="exact", dm1s=None):
+                        mo_coeff=None, ontop="exact", dm1s=None):
     """Short-range Hartree + xc energy with the spin polarization from Pi.
 
     t translation (`pyscf.gbci.srpdft`): zeta = 0 wherever R = 4 Pi / rho^2
-    >= 1.  ``report``, if given, collects the density with R > 1
-    (``electrons_unpolarized``), with Pi < 0 (``electrons_saturated``) and
-    evaluated unpolarized after a libxc failure (``electrons_fallback``).
+    >= 1.
 
     ``ontop="cas_cumulant"``: Pi = rho_a rho_b + active CAS cumulant (as
     ``otpd.energy_ot``), rho_a, rho_b from ``dm1s`` (dm1 / 2 each when not
@@ -138,14 +115,13 @@ def sr_hxc_energy_ontop(mc, dm1, ci, otpd_data, omega=DEFAULT_OMEGA,
         grids = gen_grid.Grids(mc.mol)
         grids.build()
         mc._gbsrpdft_grids = grids
-    if ot_root_cache is None and ontop == "exact":
+    ot_root_cache = None
+    if ontop == "exact":
         ot_root_cache = _otpd.make_root_intermediates(
             np.asarray(ci).real, otpd_data)
 
     ni = numint.NumInt()
     fnals = [f for f in (x_fnal, xc) if f]
-    n_sat = n_fb = 0
-    rho_sat = rho_fb = rho_scr = 0.0
     for ao, mask, weight, _ in ni.block_loop(mc.mol, grids, mc.mol.nao, 1,
                                              mc.max_memory):
         rho = ni.eval_rho(mc.mol, ao, dm1, mask, "GGA", hermi=1)
@@ -159,30 +135,12 @@ def sr_hxc_energy_ontop(mc, dm1, ci, otpd_data, omega=DEFAULT_OMEGA,
                 mc, ao, np.asarray(ci).real, otpd_data, mo_coeff, 0, mask,
                 ot_root_cache=ot_root_cache)).ravel()
         u = srpdft.ratio_from_pair_density(rho[0], Pi)
-        # a closed-shell core sits at u = 0 up to noise; count only R > 1.01
-        # and the Pi < 0 tails
-        scr, hi = u < -0.01, u > 1.0
-        if scr.any():
-            rho_scr += float(np.dot(rho[0][scr], weight[scr]))
-        if hi.any():
-            n_sat += int(hi.sum())
-            rho_sat += float(np.dot(rho[0][hi], weight[hi]))
         for fnal in fnals:
-            sub = {}
-            exc = srpdft.exc_ontop(fnal, rho, u, omega=omega, report=sub)
-            nfb = sub.get("n_unpolarized_fallback", 0)
-            if nfb:
-                m = sub["fallback_mask"]
-                n_fb += nfb
-                rho_fb = max(rho_fb, float(np.dot(rho[0][m], weight[m])))
+            exc = srpdft.exc_ontop(fnal, rho, u, omega=omega)
             e += float(np.dot(exc * rho[0], weight))
-    _assert_sr_finite(omega, xc, x_fnal, 1.0, sr_hxc_energy_ontop=[e])
-    if report is not None:
-        report["n_saturated"] = n_sat
-        report["electrons_saturated"] = rho_sat
-        report["n_fallback"] = n_fb
-        report["electrons_fallback"] = rho_fb
-        report["electrons_unpolarized"] = rho_scr
+    if not np.isfinite(e):
+        raise RuntimeError("short-range energy is not finite (omega=%g)"
+                           % omega)
     return e
 
 
@@ -257,33 +215,38 @@ class _Context(object):
             mo_coeff, mc.ncas, mc.nelecas, mc.ncore,
             intermediates["dmet_core_list"], intermediates["conf_info_list"],
             intermediates["ov_list"])
-        self.otpd_data = gbci_otpd.make_otpd_intermediates(
-            mc.mol.intor("int1e_ovlp"), mo_coeff, mc.ncas, mc.nelecas,
-            mc.ncore, intermediates["dmet_core_list"],
-            intermediates["conf_info_list"], intermediates["ov_list"])
-        self.ham_lr = lr_hamiltonian(mc, mo_coeff, intermediates, omega)
+        self._otpd_data = None
+        self._ham_lr = None
         self._otpd_pdft = None
         self._ham_full = None
+
+    @property
+    def otpd_data(self):
+        if self._otpd_data is None:
+            inter = self.inter
+            self._otpd_data = gbci_otpd.make_otpd_intermediates(
+                self.mc.mol.intor("int1e_ovlp"), self.mo, self.mc.ncas,
+                self.mc.nelecas, self.mc.ncore, inter["dmet_core_list"],
+                inter["conf_info_list"], inter["ov_list"])
+        return self._otpd_data
+
+    @property
+    def ham_lr(self):
+        if self._ham_lr is None:
+            self._ham_lr = lr_hamiltonian(self.mc, self.mo, self.inter,
+                                          self.omega)
+        return self._ham_lr
 
     def dm1s(self, civec):
         return np.asarray(gbci_rdm.make_rdm1s_precomputed(
             np.asarray(civec).real, self.rdm_data, mo_coeff=self.mo))
 
-    def dm1(self, civec):
-        dm1s = self.dm1s(civec)
-        return dm1s[0] + dm1s[1]
-
-    def e_sr(self, civec, report=None):
+    def e_sr(self, civec):
         c = np.asarray(civec).real
         dm1s = self.dm1s(c)
         return sr_hxc_energy_ontop(
             self.mc, dm1s[0] + dm1s[1], c, self.otpd_data, omega=self.omega,
-            mo_coeff=self.mo, report=report, ontop=self.ontop, dm1s=dm1s)
-
-    def e_sr_states(self, ci_list):
-        reps = [dict() for _ in ci_list]
-        e = np.array([self.e_sr(c, r) for c, r in zip(ci_list, reps)])
-        return e, reps
+            mo_coeff=self.mo, ontop=self.ontop, dm1s=dm1s)
 
     def ham_full(self):
         if self._ham_full is None:
@@ -292,11 +255,11 @@ class _Context(object):
 
     def energies(self, ci_list):
         '''<H^lr> + E^sr[rho, Pi] per state.  Returns (energies, <H^lr>,
-        E^sr, reports).'''
+        E^sr).'''
         e_lr = np.diag(hamiltonian_matrix(self.mc, self.ham_lr, self.inter,
                                           ci_list)).copy()
-        e_sr, reps = self.e_sr_states(ci_list)
-        return e_lr + e_sr, e_lr, e_sr, reps
+        e_sr = np.array([self.e_sr(c) for c in ci_list])
+        return e_lr + e_sr, e_lr, e_sr
 
     def xms(self, ci_list, ham_ref=None, diag=None):
         '''XMS intermediate states, H^eff, and the adiabatic result.
@@ -313,24 +276,22 @@ class _Context(object):
         theta = [np.asarray(t) for t in theta]
         heff = hamiltonian_matrix(self.mc, ham_ref, self.inter, theta)
         if diag is None:
-            d, _, e_sr, reps = self.energies(theta)
+            d = self.energies(theta)[0]
         else:
-            d, e_sr, reps = np.asarray([diag(t) for t in theta]), None, None
+            d = np.asarray([diag(t) for t in theta])
         heff[np.diag_indices_from(heff)] = d
         e, si = linalg.eigh(heff)
         ci_ad = list(np.tensordot(si.T, np.asarray(theta), axes=1))
         return {"e_states": e, "si": si, "heff": heff, "ci_theta": theta,
-                "ci": ci_ad, "e_sr_theta": e_sr, "reports": reps}
+                "ci": ci_ad}
 
-    def fcd(self, ci_list, weights, ham_ref, partition="round",
-            degen_tol=1e-6, diag=None):
+    def fcd(self, ci_list, weights, ham_ref, diag=None):
         '''Fragment-charge-difference (Voityuk-Rosch) diabats instead of the
         XMS rotation: eigenvectors of Q_IJ = <Psi_I|N|Psi_J>, N(det) =
-        sum_p n_p weights[p]; ``partition="round"`` rounds the eigenvalues
-        to integer sectors and diagonalizes ``ham_ref`` inside each sector,
-        ``"none"`` keeps every Q eigenvector (``ham_ref`` only inside
-        |dq| < ``degen_tol``).  H^eff off-diagonal from ``ham_ref``;
-        diagonal <H^lr> + E^sr of each diabat, or ``diag(phi)`` when given.
+        sum_p n_p weights[p], with the eigenvalues rounded to integer sectors
+        and ``ham_ref`` diagonalized inside each sector.  H^eff off-diagonal
+        from ``ham_ref``; diagonal <H^lr> + E^sr of each diabat, or
+        ``diag(phi)`` when given.
         '''
         ncas, nelecas = self.mc.ncas, self.mc.nelecas
 
@@ -345,12 +306,7 @@ class _Context(object):
         Q = np.array([[np.vdot(a.ravel(), (ndet * b).ravel()) for b in ci]
                       for a in ci])
         q, U = linalg.eigh(Q)
-        if partition == "round":
-            sector = np.rint(q).astype(int)
-        elif partition == "none":
-            sector = np.concatenate([[0], np.cumsum(np.diff(q) >= degen_tol)])
-        else:
-            raise ValueError("partition must be 'round' or 'none'")
+        sector = np.rint(q).astype(int)
         phi = list(np.tensordot(U.T, np.asarray(ci), axes=1))
         for s in sorted(set(sector.tolist())):
             idx = np.where(sector == s)[0]
@@ -363,16 +319,13 @@ class _Context(object):
                     phi[i] = sub[k]
         heff = hamiltonian_matrix(self.mc, ham_ref, self.inter, phi)
         if diag is None:
-            d, _, e_sr, reps = self.energies(phi)
+            d = self.energies(phi)[0]
         else:
-            d, e_sr, reps = np.asarray([diag(p) for p in phi]), None, None
+            d = np.asarray([diag(p) for p in phi])
         heff[np.diag_indices_from(heff)] = d
         e, si = linalg.eigh(heff)
-        n_phi = [float(np.vdot(p.ravel(), (ndet * p).ravel())) for p in phi]
         return {"e_states": e, "si": si, "heff": heff, "ci_theta": phi,
-                "ci": list(np.tensordot(si.T, np.asarray(phi), axes=1)),
-                "q": q, "sector": sector, "n_diabat": n_phi,
-                "e_sr_theta": e_sr, "reports": reps}
+                "ci": list(np.tensordot(si.T, np.asarray(phi), axes=1))}
 
     def e_pdft(self, civec, ot=None, ontop="exact"):
         '''GB-PDFT energy of one state; ``ot`` defaults to the GBCI object's.
@@ -418,9 +371,8 @@ def kernel_ss(mc, ci_gbci, mo_coeff=None, omega=DEFAULT_OMEGA,
         mo_coeff = mc.mo_coeff
     inter = _intermediates(mc, mo_coeff, intermediates)
     ctx = _Context(mc, mo_coeff, inter, omega, ontop=ontop)
-    e, e_lr, e_sr, reps = ctx.energies([np.asarray(c) for c in ci_gbci])
-    return {"e_states": e, "e_lr": e_lr, "e_sr": e_sr, "reports": reps,
-            "omega": float(omega)}
+    e, e_lr, e_sr = ctx.energies([np.asarray(c) for c in ci_gbci])
+    return {"e_states": e, "e_lr": e_lr, "e_sr": e_sr}
 
 
 def kernel_xms_gbci(mc, ci_gbci, mo_coeff=None, omega=DEFAULT_OMEGA,
@@ -439,9 +391,7 @@ def kernel_xms_gbci(mc, ci_gbci, mo_coeff=None, omega=DEFAULT_OMEGA,
         mo_coeff = mc.mo_coeff
     inter = _intermediates(mc, mo_coeff, intermediates)
     ctx = _Context(mc, mo_coeff, inter, omega, ontop=ontop)
-    out = ctx.xms([np.asarray(c) for c in ci_gbci], ham_ref=ctx.ham_full())
-    out.update(omega=float(omega))
-    return out
+    return ctx.xms([np.asarray(c) for c in ci_gbci], ham_ref=ctx.ham_full())
 
 
 def kernel_xms_gbpdft(mc, ci_gbci, mo_coeff=None, intermediates=None,
@@ -474,17 +424,13 @@ def fragment_weights(mol, mo_coeff, ncore, ncas, atoms):
 
 
 def kernel_fcd_xms(mc, ci_gbci, weights, mo_coeff=None, intermediates=None,
-                   otxc=None, partition="round", degen_tol=1e-6,
-                   ontop="exact"):
+                   otxc=None, ontop="exact"):
     '''XMS-GBPDFT with fragment-charge-difference (Voityuk-Rosch) diabats.
 
     N(det) = sum_p n_p weights[p] (weights: per active MO, e.g. the donor
     Lowdin weight, or 1 on a virtual MO set for the excitation rank).
     Q_IJ = <Psi_I|N|Psi_J> over the GBCI roots ``ci_gbci``; its eigenvalues
     are rounded to integer sectors and H is diagonalized inside each sector.
-    ``partition="none"``: no rounding; every Q eigenvector is its own
-    diabat, and H only fixes the rotation inside numerically degenerate Q
-    eigenvalues (|dq| < ``degen_tol``).
     H^eff diagonal: GB-PDFT of each diabat (``otxc`` overrides the
     functional); off-diagonal: full-Coulomb GBCI.  Depends on the model
     space, i.e. on nroots.
@@ -498,14 +444,12 @@ def kernel_fcd_xms(mc, ci_gbci, weights, mo_coeff=None, intermediates=None,
         ot.grids = mc.otfnal.grids
     inter = _intermediates(mc, mo_coeff, intermediates)
     ctx = _Context(mc, mo_coeff, inter, DEFAULT_OMEGA)
-    return ctx.fcd(ci_gbci, weights, ctx.ham_full(), partition=partition,
-                   degen_tol=degen_tol,
+    return ctx.fcd(ci_gbci, weights, ctx.ham_full(),
                    diag=lambda p: ctx.e_pdft(p, ot=ot, ontop=ontop))
 
 
 def kernel_fcd_gbci(mc, ci_gbci, weights, mo_coeff=None,
-                    omega=DEFAULT_OMEGA, intermediates=None,
-                    partition="round", degen_tol=1e-6, ontop="exact"):
+                    omega=DEFAULT_OMEGA, intermediates=None, ontop="exact"):
     '''FCD-GB-srPDFT: :func:`kernel_xms_gbci` with the XMS rotation replaced
     by fragment-charge-difference diabats (:func:`kernel_fcd_xms`).
 
@@ -516,7 +460,4 @@ def kernel_fcd_gbci(mc, ci_gbci, weights, mo_coeff=None,
         mo_coeff = mc.mo_coeff
     inter = _intermediates(mc, mo_coeff, intermediates)
     ctx = _Context(mc, mo_coeff, inter, omega, ontop=ontop)
-    out = ctx.fcd(ci_gbci, weights, ctx.ham_full(), partition=partition,
-                  degen_tol=degen_tol)
-    out.update(omega=float(omega))
-    return out
+    return ctx.fcd(ci_gbci, weights, ctx.ham_full())

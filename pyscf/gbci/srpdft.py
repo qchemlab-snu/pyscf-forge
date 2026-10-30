@@ -28,8 +28,7 @@ RHO_CUTOFF = 1e-12
 NUDGE = 1e-12
 
 
-def eval_xc_finite(fnal, rho, spin=0, deriv=1, omega=None, on_fail="raise",
-                   report=None):
+def eval_xc_finite(fnal, rho, spin=0, deriv=1, omega=None, on_fail="raise"):
     """``libxc.eval_xc`` with its isolated NaN points repaired.
 
     Points whose output is non-finite are recomputed at ``rho * (1 + NUDGE)``
@@ -45,9 +44,7 @@ def eval_xc_finite(fnal, rho, spin=0, deriv=1, omega=None, on_fail="raise",
         a = np.asarray(a)
         fin = np.isfinite(a) if a.ndim == 1 else np.isfinite(a).all(axis=1)
         bad |= ~fin
-    n_bad = int(bad.sum())
-    n_fixed = 0
-    if n_bad:
+    if bad.any():
         sub = libxc.eval_xc(fnal, rho[..., bad] * (1.0 + NUDGE), spin=spin,
                             deriv=deriv, omega=omega)
         exc[bad] = sub[0]
@@ -60,7 +57,6 @@ def eval_xc_finite(fnal, rho, spin=0, deriv=1, omega=None, on_fail="raise",
             a = np.asarray(a)
             fin = np.isfinite(a) if a.ndim == 1 else np.isfinite(a).all(axis=1)
             still |= ~fin
-        n_fixed = n_bad - int(still.sum())
         if still.any() and on_fail == "raise":
             i = int(np.argmax(still))
             raise FloatingPointError(
@@ -68,9 +64,6 @@ def eval_xc_finite(fnal, rho, spin=0, deriv=1, omega=None, on_fail="raise",
                 "a %g relative nudge; first: rho[..., %d] = %r"
                 % (fnal, spin, omega, int(still.sum()), NUDGE, i,
                    rho[..., i].tolist()))
-    if report is not None:
-        report["n_repaired"] = report.get("n_repaired", 0) + n_fixed
-        report["n_unrepaired"] = report.get("n_unrepaired", 0) + n_bad - n_fixed
     return out
 
 
@@ -97,15 +90,14 @@ def ratio_from_pair_density(rho, Pi, tol=1e-12):
     return u
 
 
-def exc_ontop(fnal, rho, u, omega=None, report=None):
+def exc_ontop(fnal, rho, u, omega=None):
     '''Exchange-correlation energy per particle at the translated on-top
     polarization.
 
     ``rho`` is ``(4, N)`` in PySCF's GGA layout and spin summed; ``u`` is
     ``1 - 4 Pi / rho^2`` per point.  u is clipped to [0, 1] and libxc is
     called at zeta = sqrt(u).  Points where the spin-polarized libxc
-    call stays non-finite fall back to the unpolarized value; ``report``
-    counts them (``n_unpolarized_fallback``, ``fallback_mask``).
+    call stays non-finite fall back to the unpolarized value.
     '''
     rho = np.asarray(rho, dtype=float)
     if rho.ndim == 1:
@@ -121,7 +113,4 @@ def exc_ontop(fnal, rho, u, omega=None, report=None):
     if bad.any():
         out[bad] = eval_xc_finite(fnal, rho[:, bad], spin=0, deriv=0,
                                   omega=omega)[0]
-    if report is not None:
-        report["n_unpolarized_fallback"] = int(bad.sum())
-        report["fallback_mask"] = bad
     return out
