@@ -14,11 +14,14 @@ from pyscf.gbci import gbpdft
 
 OTXCS = ("tPBE", "tPBE0")
 
+# References at the converged bath limit (bath gradient 1e-9).  The XMS
+# energy is linear in the bath orbitals; only the converged values do not
+# depend on the FASSCF solver path.
 LIH_XMS_GROUP_CASES = (
-    ("none", None, -7.825301573668843),
-    ("mo", {"mo": [[0], [1]]}, -7.825301573668855),
-    ("atom", {"atom": [[0], [1]]}, -7.825301573668856),
-    ("occ", {"occ": [[0], [1], [2]]}, -7.825301573668856),
+    ("none", None, -7.825301578604353),
+    ("mo", {"mo": [[0], [1]]}, -7.825301578604353),
+    ("atom", {"atom": [[0], [1]]}, -7.825301578604353),
+    ("occ", {"occ": [[0], [1], [2]]}, -7.825301578604353),
 )
 
 _MCS = []

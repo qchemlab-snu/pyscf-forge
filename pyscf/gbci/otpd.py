@@ -302,6 +302,33 @@ def _contract_grid_mats(grid_a, grid_b, packed_mats):
     return out
 
 
+def _active_active_pair_density_from_mo_grid(Ma, gamma, dtype=None):
+    """Return the active-active opposite-spin on-top pair density."""
+    pi = np.zeros((1, Ma.shape[0]), dtype=np.result_type(Ma, gamma, dtype))
+    if gamma.size:
+        tmp = lib.einsum("gc,gd,abcd->gab", Ma, Ma, gamma, optimize=True)
+        pi[0] += lib.einsum("ga,gb,gab->g", Ma, Ma, tmp, optimize=True)
+    return pi
+
+
+def get_active_active_ontop_pair_density(
+        ot, ao, ci, data, mo=None, deriv=0, non0tab=None,
+        ot_root_cache=None):
+    """Build only the active-active on-top pair density on a grid block."""
+    if deriv != 0:
+        raise NotImplementedError("GBPDFT currently supports Pi_deriv=0 only")
+    if ot_root_cache is None:
+        ot_root_cache = make_root_intermediates(ci, data)
+    if mo is None:
+        mo = data["mo_coeff"]
+    if ao.ndim == 2:
+        ao = ao.reshape(1, ao.shape[0], ao.shape[1])
+    M = _grid_ao2mo(ot.mol, ao, mo, non0tab=non0tab)[0]
+    Ma = M[:, data["ncore"]:data["ncore"] + data["ncas"]]
+    return _active_active_pair_density_from_mo_grid(
+        Ma, ot_root_cache["Gamma_ab_ac"], data["dtype"])
+
+
 def get_ontop_pair_density(ot, ao, ci, data, mo=None, deriv=0,
                            non0tab=None, ot_root_cache=None):
     """Build the on-top pair density directly on a grid block."""
@@ -321,11 +348,8 @@ def get_ontop_pair_density(ot, ao, ci, data, mo=None, deriv=0,
     M = mo_grid[0]
     Ma = M[:, data["ncore"]:data["ncore"] + data["ncas"]]
 
-    Pi = np.zeros((1, M.shape[0]), dtype=np.result_type(M, data["dtype"]))
-    Gamma = ot_root_cache["Gamma_ab_ac"]
-    if Gamma.size:
-        tmp = lib.einsum("gc,gd,abcd->gab", Ma, Ma, Gamma, optimize=True)
-        Pi[0] += lib.einsum("ga,gb,gab->g", Ma, Ma, tmp, optimize=True)
+    Pi = _active_active_pair_density_from_mo_grid(
+        Ma, ot_root_cache["Gamma_ab_ac"], data["dtype"])
 
     Pi[0] += _contract_core_pair(
         np.ascontiguousarray(M), Ma, data,
@@ -337,11 +361,33 @@ def get_ontop_pair_density(ot, ao, ci, data, mo=None, deriv=0,
     return Pi
 
 
+def make_cas_cumulant(ci, ncas, nelecas):
+    """Spin-summed active cumulant of the CI vector read as a CASCI vector.
+
+    The bath overlaps are ignored and nothing outside the active space is
+    kept: this is the approximation of Ref. [1], used only for comparison.
+    """
+    from pyscf.fci import direct_spin1
+    from pyscf.mcpdft import _dms
+    ci = np.asarray(ci).real
+    casdm1s = np.asarray(direct_spin1.make_rdm1s(ci, ncas, nelecas))
+    casdm2 = direct_spin1.make_rdm12(ci, ncas, nelecas)[1]
+    return _dms.dm2_cumulant(casdm2, casdm1s)
+
+
 def energy_ot(ot, dm1s, mo_coeff, ncore, ncas, ci=None, data=None,
-              ot_root_cache=None, max_memory=1000, hermi=1):
-    """Compute the GBPDFT on-top energy without materializing full 2-RDM."""
+              ot_root_cache=None, max_memory=1000, hermi=1, ontop="exact"):
+    """Compute the GBPDFT on-top energy without materializing full 2-RDM.
+
+    ``ontop="exact"`` is the one-step Pi of the GBCI state.
+    ``ontop="cas_cumulant"`` is Pi = rho_a rho_b + active CAS cumulant of
+    Ref. [1], with rho from ``dm1s``; it drops every bath term of the
+    cumulant.
+    """
     if ci is None or data is None:
         raise ValueError("ci and precomputed GBPDFT data are required")
+    if ontop not in ("exact", "cas_cumulant"):
+        raise ValueError("ontop must be 'exact' or 'cas_cumulant'")
 
     ni = ot._numint
     if ot.xctype == 'HF':
@@ -352,14 +398,22 @@ def energy_ot(ot, dm1s, mo_coeff, ncore, ncas, ci=None, data=None,
     nao = mo_coeff.shape[0]
     make_rho = tuple(
         ni._gen_rho_evaluator(ot.mol, dm1s[i], hermi) for i in range(2))
+    if ontop == "cas_cumulant":
+        from pyscf.mcpdft import otpd as mcpdft_otpd
+        cascm2 = make_cas_cumulant(ci, ncas, data["nelecas"])
+        mo_cas = mo_coeff[:, ncore:ncore + ncas]
 
     E_ot = 0.0
     for ao, mask, weight, _ in ni.block_loop(
             ot.mol, ot.grids, nao, ot.dens_deriv, max_memory):
         rho = np.asarray([m[0](0, ao, mask, ot.xctype) for m in make_rho])
-        Pi = get_ontop_pair_density(
-            ot, ao, ci, data, mo_coeff, ot.Pi_deriv, mask,
-            ot_root_cache=ot_root_cache)
+        if ontop == "cas_cumulant":
+            Pi = mcpdft_otpd.get_ontop_pair_density(
+                ot, rho, ao, cascm2, mo_cas, ot.Pi_deriv, mask)
+        else:
+            Pi = get_ontop_pair_density(
+                ot, ao, ci, data, mo_coeff, ot.Pi_deriv, mask,
+                ot_root_cache=ot_root_cache)
         if rho.ndim == 2:
             rho = np.expand_dims(rho, 1)
         if Pi.ndim == 1:

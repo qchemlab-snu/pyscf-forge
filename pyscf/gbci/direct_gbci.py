@@ -33,6 +33,8 @@ from pyscf.lib import logger
 from pyscf.fci import spin_op
 from pyscf.fci import cistring
 from pyscf.fci import direct_uhf
+from pyscf.fci import direct_spin1
+from pyscf.fci import direct_nosym
 from pyscf.fci.direct_spin1 import FCIBase, FCISolver, FCIvector
 
 libgbci = lib.load_library("libgbci")
@@ -47,32 +49,33 @@ def str2occ(str0,norb):
 
     return occ
 
-def make_hdiag(h1e, eri, ncas, nelecas, conf_info_list, ecore_list, opt=None):
+def _unpack_nelec(nelecas):
     if isinstance(nelecas, (int, numpy.integer)):
         nelecb = nelecas//2
-        neleca = nelecas - nelecb
-    else:
-        neleca, nelecb = nelecas
-    occslista = cistring.gen_occslst(range(ncas), neleca)
-    occslistb = cistring.gen_occslst(range(ncas), nelecb)
+        return nelecas - nelecb, nelecb
+    return int(nelecas[0]), int(nelecas[1])
+
+def string_occs(ncas, nelec):
+    '''Occupation (0/1) of every orbital in every string, (nstr, ncas).'''
+    strs = numpy.asarray(cistring.make_strings(range(ncas), nelec))
+    return ((strs[:, None] >> numpy.arange(ncas)[None, :]) & 1).astype(float)
+
+def make_hdiag(h1e, eri, ncas, nelecas, conf_info_list, ecore_list, opt=None):
+    '''Diagonal of the GBCI Hamiltonian.  The two-electron part is the same
+    for all groups (direct_spin1.make_hdiag); the one-electron part and the
+    core energy come from the group of each determinant.'''
+    neleca, nelecb = _unpack_nelec(nelecas)
+    conf = numpy.asarray(conf_info_list)
     eri = ao2mo.restore(1, eri, ncas)
-    diagj = numpy.einsum('iijj->ij', eri)
-    diagk = numpy.einsum('ijji->ij', eri)
-    hdiag = []
-    for str0a, aocc in enumerate(occslista):
-        for str0b, bocc in enumerate(occslistb):
-            occ = numpy.zeros(ncas)
-            for i in aocc:
-                occ[i] += 1
-            for i in bocc:
-                occ[i] +=1
-            p = conf_info_list[str0a, str0b]
-            e1 = h1e[p,p,aocc,aocc].sum() + h1e[p,p,bocc,bocc].sum()
-            e2 = diagj[aocc][:,aocc].sum() + diagj[aocc][:,bocc].sum() \
-               + diagj[bocc][:,aocc].sum() + diagj[bocc][:,bocc].sum() \
-               - diagk[aocc][:,aocc].sum() - diagk[bocc][:,bocc].sum()
-            hdiag.append(e1 + e2*.5 + ecore_list[p])
-    return numpy.array(hdiag)
+    h2 = numpy.asarray(direct_spin1.make_hdiag(
+        numpy.zeros((ncas, ncas)), eri, ncas, (neleca, nelecb))).reshape(conf.shape)
+    hd = numpy.einsum('ggpp->gp', numpy.asarray(h1e))
+    ea = string_occs(ncas, neleca).dot(hd.T)
+    eb = string_occs(ncas, nelecb).dot(hd.T)
+    ia = numpy.arange(conf.shape[0])[:, None]
+    ib = numpy.arange(conf.shape[1])[None, :]
+    e1 = ea[ia, conf] + eb[ib, conf]
+    return (h2 + e1 + numpy.asarray(ecore_list)[conf]).ravel()
 
 def absorb_h1e(h1e, eri, ncas, nelecas, fac=1):
     '''Modify 2e Hamiltonian to include effective 1e Hamiltonian contribution
@@ -265,6 +268,287 @@ def contract_h_slow(erieff, civec, ncas, nelecas, conf_info_list, ov_list, ecore
     cinew.reshape(-1)
     return cinew
 
+class BlockSigma:
+    r'''H|CI> by group blocks with the PySCF FCI kernels.
+
+    With the group masks P_g and W_g[I] = ov[g_I, g],
+
+        H c = ecore o c + sum_g W_g o V (P_g c)
+              + sum_{g,g'} ov[g,g'] P_g h^{gg'} (P_g' c),
+
+    V the active two-electron operator (the same for all groups) and h^{gg'}
+    the pair one-electron Hamiltonian.  One direct_spin1.contract_2e per
+    group and one direct_nosym.contract_1e per coupled group pair.  Memory
+    O(N_det); contract_h keeps excitation tables of size O(ncas^4 N_str^2).
+    '''
+    def __init__(self, h1e, eri, ncas, nelecas, conf_info_list, ov_list,
+                 ecore_list):
+        neleca, nelecb = _unpack_nelec(nelecas)
+        self.ncas = ncas
+        self.nelec = (neleca, nelecb)
+        self.conf = numpy.asarray(conf_info_list)
+        self.ov = numpy.asarray(ov_list, dtype=float)
+        self.h1e = numpy.asarray(h1e, dtype=float)
+        self.diag_core = numpy.asarray(ecore_list, dtype=float)[self.conf]
+        self.groups = [int(g) for g in numpy.unique(self.conf)]
+        self.eri = direct_spin1.absorb_h1e(
+            numpy.zeros((ncas, ncas)), ao2mo.restore(1, eri, ncas),
+            ncas, self.nelec, .5)
+        self.link_tril = (
+            cistring.gen_linkstr_index_trilidx(range(ncas), neleca),
+            cistring.gen_linkstr_index_trilidx(range(ncas), nelecb))
+        self.link_full = (cistring.gen_linkstr_index(range(ncas), neleca),
+                          cistring.gen_linkstr_index(range(ncas), nelecb))
+
+    def contract(self, civec):
+        shape = self.conf.shape
+        c = numpy.asarray(civec, dtype=float).reshape(shape)
+        sigma = self.diag_core * c
+        for gk in self.groups:
+            ck = numpy.where(self.conf == gk, c, 0.)
+            v = direct_spin1.contract_2e(self.eri, ck, self.ncas, self.nelec,
+                                         self.link_tril)
+            sigma += self.ov[self.conf, gk] * v.reshape(shape)
+            for gb in self.groups:
+                w = self.ov[gb, gk]
+                if w == 0:
+                    continue
+                h = numpy.ascontiguousarray(self.h1e[gb, gk] * w)
+                v = direct_nosym.contract_1e(h, ck, self.ncas, self.nelec,
+                                             self.link_full).reshape(shape)
+                mask = self.conf == gb
+                sigma[mask] += v[mask]
+        return sigma.reshape(numpy.shape(civec))
+
+def contract_h_block(h1e, eri, civec, ncas, nelecas, conf_info_list, ov_list,
+                     ecore_list):
+    '''Compute H|CI> by group blocks (see BlockSigma).'''
+    return BlockSigma(h1e, eri, ncas, nelecas, conf_info_list, ov_list,
+                      ecore_list).contract(civec)
+
+def _popcount(x):
+    x = numpy.asarray(x, dtype=numpy.int64)
+    c = numpy.zeros(x.shape, dtype=numpy.int64)
+    while numpy.any(x):
+        c += x & 1
+        x = x >> 1
+    return c
+
+def _bit_index(v):
+    '''Index of the only set bit of every element of v.'''
+    return numpy.log2(numpy.asarray(v, dtype=float)).astype(numpy.int64)
+
+def _cre_des_sign(p, q, s):
+    '''cistring.cre_des_sign(p, q, s) for arrays (p != q, p empty and q
+    occupied in s): (-1)^(number of occupied orbitals between p and q).'''
+    lo = numpy.minimum(p, q)
+    hi = numpy.maximum(p, q)
+    one = numpy.int64(1)
+    mask = (one << hi) - (one << (lo + 1))
+    return 1 - 2 * (_popcount(s & mask) & 1)
+
+# coupled determinant pairs per vectorized chunk of pspace_hamiltonian
+PSPACE_PAIR_CHUNK = 1 << 20
+
+def pspace_hamiltonian(h1e, eri, ncas, nelecas, conf_info_list, ov_list,
+                       ecore_list, addr, hdiag):
+    '''Exact GBCI Hamiltonian on the determinants addr (flat indices into
+    the (na, nb) CI array), from the Slater-Condon rules on the bit strings.
+    The diagonal is taken from hdiag.'''
+    neleca, nelecb = _unpack_nelec(nelecas)
+    conf = numpy.asarray(conf_info_list)
+    nb = conf.shape[1]
+    g2 = ao2mo.restore(1, eri, ncas)
+    h1e = numpy.asarray(h1e)
+    sa = numpy.asarray(cistring.make_strings(range(ncas), neleca), dtype=numpy.int64)
+    sb = numpy.asarray(cistring.make_strings(range(ncas), nelecb), dtype=numpy.int64)
+    addr = numpy.asarray(addr)
+    ia, ib = addr // nb, addr % nb
+    stra, strb = sa[ia], sb[ib]
+    grp = conf[ia, ib]
+    h0 = numpy.diag(numpy.asarray(hdiag)[addr]).astype(float)
+    da = _popcount(stra[:, None] ^ stra[None, :])
+    db = _popcount(strb[:, None] ^ strb[None, :])
+    deg = da + db
+    x, y = numpy.nonzero(numpy.triu((deg == 2) | (deg == 4), 1))
+    w = numpy.asarray(ov_list, dtype=float)[grp[x], grp[y]]
+    keep = w != 0
+    x, y, w = x[keep], y[keep], w[keep]
+    jd = numpy.einsum('pqkk->pqk', g2)
+    kd = numpy.einsum('pkkq->pqk', g2)
+    for p0 in range(0, x.size, PSPACE_PAIR_CHUNK):
+        sl = slice(p0, p0 + PSPACE_PAIR_CHUNK)
+        val = _pair_values(h1e, g2, jd, kd, ncas, stra, strb, grp,
+                           da, db, x[sl], y[sl])
+        h0[x[sl], y[sl]] = w[sl] * val
+        h0[y[sl], x[sl]] = w[sl] * val
+    return h0
+
+def _pair_values(h1e, g2, jd, kd, ncas, stra, strb, grp, da, db, x, y):
+    '''<x|H|y> / ov[g_x, g_y] of the coupled determinant pairs (x, y).'''
+    dax, dbx = da[x, y], db[x, y]
+    ax, ay, bx, by = stra[x], stra[y], strb[x], strb[y]
+    val = numpy.zeros(x.size)
+    bits = numpy.arange(ncas)
+    # single excitations in one spin
+    for sel, sx, sy, other in (((dax == 2) & (dbx == 0), ax, ay, by),
+                               ((dax == 0) & (dbx == 2), bx, by, ay)):
+        k = numpy.nonzero(sel)[0]
+        if k.size == 0:
+            continue
+        sx, sy, other = sx[k], sy[k], other[k]
+        p = _bit_index(sx & ~sy)
+        q = _bit_index(sy & ~sx)
+        occ_same = ((sy[:, None] >> bits) & 1).astype(float)
+        occ_same[numpy.arange(k.size), q] = 0
+        occ_other = ((other[:, None] >> bits) & 1).astype(float)
+        jpq, kpq = jd[p, q], kd[p, q]
+        v = (h1e[grp[x[k]], grp[y[k]], p, q]
+             + numpy.einsum('xk,xk->x', occ_same, jpq - kpq)
+             + numpy.einsum('xk,xk->x', occ_other, jpq))
+        val[k] = _cre_des_sign(p, q, sy) * v
+    # double excitations in one spin
+    k = numpy.nonzero((dax == 4) | (dbx == 4))[0]
+    if k.size:
+        alpha = dax[k] == 4
+        sx = numpy.where(alpha, ax[k], bx[k])
+        sy = numpy.where(alpha, ay[k], by[k])
+        d1, d2 = sx & ~sy, sy & ~sx
+        p = _bit_index(d1 & -d1)
+        r = _bit_index(d1 ^ (d1 & -d1))
+        q = _bit_index(d2 & -d2)
+        s = _bit_index(d2 ^ (d2 & -d2))
+        one = numpy.int64(1)
+        s1 = _cre_des_sign(r, s, sy)
+        s2 = _cre_des_sign(p, q, sy ^ (one << s) ^ (one << r))
+        val[k] = s1 * s2 * (g2[p, q, r, s] - g2[p, s, r, q])
+    # alpha single x beta single
+    k = numpy.nonzero((dax == 2) & (dbx == 2))[0]
+    if k.size:
+        p = _bit_index(ax[k] & ~ay[k])
+        q = _bit_index(ay[k] & ~ax[k])
+        r = _bit_index(bx[k] & ~by[k])
+        s = _bit_index(by[k] & ~bx[k])
+        val[k] = (_cre_des_sign(p, q, ay[k]) * _cre_des_sign(r, s, by[k])
+                  * g2[p, q, r, s])
+    return val
+
+def spin_complete_pspace(hdiag, ncas, nelecas, npsp):
+    '''Addresses of the pspace block: the determinants of lowest hdiag,
+    extended to whole spin-coupling sets (all determinants of one spatial
+    occupation), at least npsp of them, ordered by hdiag.  A block that cuts
+    a set mixes spin states.'''
+    neleca, nelecb = _unpack_nelec(nelecas)
+    hdiag = numpy.asarray(hdiag).ravel()
+    w = 3 ** numpy.arange(ncas)
+    keys = [string_occs(ncas, n).dot(w) for n in (neleca, nelecb)]
+    key = (keys[0][:, None] + keys[1][None, :]).ravel()
+    uk, inv, cnt = numpy.unique(key, return_inverse=True, return_counts=True)
+    inv = inv.ravel()
+    seen = numpy.zeros(uk.size, dtype=bool)
+    count = 0
+    for d in numpy.argsort(hdiag, kind='stable'):
+        u = inv[d]
+        if seen[u]:
+            continue
+        seen[u] = True
+        count += cnt[u]
+        if count >= npsp:
+            break
+    addr = numpy.where(seen[inv])[0]
+    return addr[numpy.argsort(hdiag[addr], kind='stable')]
+
+def _spin_target(nelecas, ss):
+    neleca, nelecb = _unpack_nelec(nelecas)
+    sz = abs(neleca - nelecb) * .5
+    ss_tgt = sz * (sz + 1) if ss is None else ss
+    # the squared penalty above the M_S minimum, as SpinPenaltyGBCISolver
+    return ss_tgt, ss_tgt >= sz * (sz + 1) + .1
+
+def spin_penalty(civec, ncas, nelecas, ss, shift):
+    '''shift (S^2 - ss) c, or shift (S^2 - ss)^2 c for ss above the M_S
+    minimum (as SpinPenaltyGBCISolver.contract_h).'''
+    nelec = _unpack_nelec(nelecas)
+    ss_tgt, square = _spin_target(nelec, ss)
+    c = numpy.asarray(civec)
+    tmp = spin_op.contract_ss(c, ncas, nelec).reshape(c.shape) - ss_tgt * c
+    if square:
+        tmp = spin_op.contract_ss(tmp, ncas, nelec).reshape(c.shape) - ss_tgt * tmp
+    return shift * tmp
+
+def s2_block(ncas, nelecas, addr):
+    '''<D_x|S^2|D_y> on the determinants addr (flat indices into the (na, nb)
+    CI array), and True if addr is closed under S^2.'''
+    neleca, nelecb = _unpack_nelec(nelecas)
+    stra = numpy.asarray(cistring.make_strings(range(ncas), neleca), dtype=numpy.int64)
+    strb = numpy.asarray(cistring.make_strings(range(ncas), nelecb), dtype=numpy.int64)
+    nb = strb.size
+    addr = numpy.asarray(addr, dtype=numpy.int64).ravel()
+    sa, sb = stra[addr // nb], strb[addr % nb]
+    sz = (neleca - nelecb) * .5
+    s2 = numpy.diag(sz * (sz + 1) + _popcount(sb & ~sa).astype(float))
+    order = numpy.argsort(addr, kind='stable')
+    sorted_addr = addr[order]
+    complete = True
+    for q in range(ncas):
+        aonly_q = ((sa >> q) & 1 == 1) & ((sb >> q) & 1 == 0)
+        if not aonly_q.any():
+            continue
+        for p in range(ncas):
+            if p == q:
+                continue
+            x = numpy.nonzero(aonly_q & ((sb >> p) & 1 == 1)
+                              & ((sa >> p) & 1 == 0))[0]
+            if x.size == 0:
+                continue
+            flip = (1 << p) | (1 << q)
+            j = (cistring.strs2addr(ncas, neleca, sa[x] ^ flip) * nb
+                 + cistring.strs2addr(ncas, nelecb, sb[x] ^ flip))
+            k = numpy.minimum(numpy.searchsorted(sorted_addr, j), addr.size - 1)
+            found = sorted_addr[k] == j
+            if not found.all():
+                complete = False
+            lo, hi = min(p, q), max(p, q)
+            mask = (1 << hi) - (1 << (lo + 1))
+            par = _popcount(sa[x] & mask) + _popcount(sb[x] & mask)
+            s2[x[found], order[k[found]]] += numpy.where(par % 2, 1., -1.)[found]
+    return s2, complete
+
+def spin_penalty_block(ncas, nelecas, addr, ss, shift):
+    '''Matrix of spin_penalty on the determinants addr.  It equals the
+    restriction of the full-space operator when addr is closed under S^2
+    (e.g. spin_complete_pspace); the flag of s2_block is returned.'''
+    nelec = _unpack_nelec(nelecas)
+    ss_tgt, square = _spin_target(nelec, ss)
+    s2, complete = s2_block(ncas, nelec, addr)
+    d = s2 - ss_tgt * numpy.eye(s2.shape[0])
+    if square:
+        d = lib.dot(d, d)
+        d = .5 * (d + d.T)
+    return shift * d, complete
+
+def make_pspace_precond(hdiag, pspaceig, pspaceci, addr, level_shift=0):
+    '''direct_spin1.make_pspace_precond with (H0 - e0)^{-1} on the pspace
+    applied from the eigenvectors of H0.'''
+    pv = numpy.asarray(pspaceci)
+    pvt = numpy.ascontiguousarray(pv.T)
+
+    def solve(e0, v):
+        return numpy.dot(pv, numpy.dot(pvt, v) / (pspaceig - (e0 - level_shift)))
+
+    def precond(r, e0, x0, *args):
+        hdiaginv = 1 / (hdiag - (e0 - level_shift))
+        hdiaginv[abs(hdiaginv) > 1e8] = 1e8
+        h0x0 = x0 * hdiaginv
+        h0x0[addr] = solve(e0, x0[addr])
+        h0r = r * hdiaginv
+        h0r[addr] = solve(e0, r[addr])
+        e1 = numpy.dot(x0, h0r) / numpy.dot(x0, h0x0)
+        x1 = r - e1 * x0
+        x1 *= hdiaginv
+        return x1
+    return precond
+
 def kernel(gbci, h1e, eri, ncas, nelecas, conf_info_list, ov_list, ecore_list,
            ci0=None, link_index=None, tol=None, lindep=None,
            max_cycle=None, max_space=None, nroots=None,
@@ -314,6 +598,15 @@ def kernel(gbci, h1e, eri, ncas, nelecas, conf_info_list, ov_list, ecore_list,
     Note: davidson solver requires more arguments. For the parameters not
     dispatched, they can be passed to davidson solver via the extra keyword
     arguments **kwargs
+
+    Solver (generalized Davidson): the exact Hamiltonian on a pspace block
+    of pspace_size determinants of lowest diagonal, completed to whole
+    spin-coupling sets and with the spin penalty of fix_spin_, gives the
+    preconditioner and the guess vectors (its eigenvectors are spin-pure).
+    Spaces of at most pspace_size determinants are diagonalized directly
+    (davidson_only=False).  pspace_size=0 uses the diagonal preconditioner
+    and determinant guesses.  H|CI> comes from gbci.sigma_kernel: 'contract_h'
+    (gbci.contract_h) or 'block' (BlockSigma).
     '''
     if nroots is None: nroots = gbci.nroots
     if davidson_only is None: davidson_only = gbci.davidson_only
@@ -326,34 +619,93 @@ def kernel(gbci, h1e, eri, ncas, nelecas, conf_info_list, ov_list, ecore_list,
     hdiag = gbci.make_hdiag(h1e, eri, ncas, nelec, conf_info_list, ecore_list).ravel()
     num_dets = hdiag.size
     civec_size = num_dets
-    precond = gbci.make_precond(hdiag)
-    addr = [0]
-    erieff = gbci.absorb_h1e(h1e, eri, ncas, nelec, .5)
-    if link_index is None:
-        link_indexa = cistring.gen_linkstr_index(range(ncas), nelec[0])
-        link_indexb = cistring.gen_linkstr_index(range(ncas), nelec[1])
-        link_index = (link_indexa, link_indexb)
-    else:
-        link_indexa, link_indexb = link_index
-
-    ts = gen_excitations(ncas, nelecas, link_index=link_index)
+    na = cistring.num_strings(ncas, nelec[0])
+    nb = cistring.num_strings(ncas, nelec[1])
+    # (shift, ss) of fix_spin_, set by SpinPenaltyGBCISolver.kernel
+    penalty = getattr(gbci, '_spin_penalty', None)
+    sigma_kernel = getattr(gbci, 'sigma_kernel', 'contract_h')
     if hop is None:
         cpu0 = [logger.process_clock(), logger.perf_counter()]
-        def hop(c):
-            hc = gbci.contract_h(erieff, c, ncas, nelecas, conf_info_list,
-                                   ov_list, ecore_list, link_index, ts)
-            cpu0[:] = log.timer_debug1('contract_h', *cpu0)
-            return hc.ravel()
-    def init_guess():
-        if callable(getattr(gbci, 'get_init_guess', None)):
-            return gbci.get_init_guess(ncas, nelecas, nroots, hdiag)
+        if sigma_kernel == 'block':
+            sigma = BlockSigma(h1e, eri, ncas, nelec, conf_info_list, ov_list,
+                               ecore_list)
+            def hop(c):
+                c = numpy.reshape(c, (na, nb))
+                hc = sigma.contract(c)
+                if penalty is not None:
+                    hc += spin_penalty(c, ncas, nelec, penalty[1], penalty[0])
+                cpu0[:] = log.timer_debug1('contract_h', *cpu0)
+                return hc.ravel()
+        elif sigma_kernel == 'contract_h':
+            # the spin penalty, if any, comes with SpinPenaltyGBCISolver.contract_h
+            erieff = gbci.absorb_h1e(h1e, eri, ncas, nelec, .5)
+            if link_index is None:
+                link_indexa = cistring.gen_linkstr_index(range(ncas), nelec[0])
+                link_indexb = cistring.gen_linkstr_index(range(ncas), nelec[1])
+                link_index = (link_indexa, link_indexb)
+            ts = gen_excitations(ncas, nelecas, link_index=link_index)
+            def hop(c):
+                hc = gbci.contract_h(erieff, c, ncas, nelecas, conf_info_list,
+                                       ov_list, ecore_list, link_index, ts)
+                cpu0[:] = log.timer_debug1('contract_h', *cpu0)
+                return hc.ravel()
         else:
+            raise ValueError("sigma_kernel must be 'block' or 'contract_h', not %r"
+                             % sigma_kernel)
+
+    pspace = None
+    if pspace_size > 0:
+        dense = num_dets <= pspace_size and not davidson_only
+        if dense:
+            addr = numpy.argsort(hdiag, kind='stable')
+        else:
+            addr = spin_complete_pspace(hdiag, ncas, nelec,
+                                        max(pspace_size, nroots))
+        h0 = pspace_hamiltonian(h1e, eri, ncas, nelec, conf_info_list,
+                                ov_list, ecore_list, addr, hdiag)
+        if penalty is not None:
+            h0 = h0 + spin_penalty_block(ncas, nelec, addr, penalty[1],
+                                         penalty[0])[0]
+        pw, pv = scipy.linalg.eigh(h0)
+        if dense:
+            # a space smaller than nroots has only num_dets roots
+            nfound = min(nroots, num_dets)
+            gbci.converged = True if nroots == 1 else [True] * nfound
+            c = numpy.zeros((num_dets, nfound))
+            c[addr] = pv[:, :nfound]
+            if nroots == 1:
+                return pw[0], c[:, 0]
+            return pw[:nfound], [c[:, k] for k in range(nfound)]
+        pspace = (pw, pv, addr)
+        precond = make_pspace_precond(hdiag, pw, pv, addr)
+    else:
+        precond = gbci.make_precond(hdiag)
+
+    def init_guess():
+        if pspace is not None:
+            pw, pv, addr = pspace
             x0 = []
-            for i in range(min(len(addr), nroots)):
+            for k in range(min(nroots, len(addr))):
                 x = numpy.zeros(civec_size)
-                x[addr[i]] = 1
+                x[addr] = pv[:, k]
                 x0.append(x)
-            return x0
+            if len(x0) < nroots:
+                x0.extend(list(gbci.get_init_guess(
+                    ncas, nelecas, nroots, hdiag))[:nroots - len(x0)])
+        else:
+            x0 = [numpy.asarray(x).ravel() for x in
+                  gbci.get_init_guess(ncas, nelecas, nroots, hdiag)]
+        noise = getattr(gbci, 'guess_noise', 0)
+        if noise:
+            # determinants of symmetry-adapted orbitals have one irrep each;
+            # a small random part reaches the irreps absent from the guess;
+            # its norm is noise for any number of determinants (unscaled, it
+            # grows as sqrt(civec_size) and swamps the guess of a large space)
+            rng = numpy.random.default_rng(7)
+            scale = noise / numpy.sqrt(civec_size)
+            x0 = [numpy.asarray(x).ravel() + scale * rng.standard_normal(civec_size)
+                  for x in x0]
+        return [x / numpy.linalg.norm(x) for x in x0]
     if ci0 is None:
         ci0 = init_guess
     elif not callable(ci0):
@@ -428,7 +780,27 @@ def fix_spin_(fciobj, shift=.1, ss=None):
 
 class GBCISolver(FCISolver):
     '''GBCI FCI solver.
+
+    Attributes (in addition to those of FCISolver):
+        sigma_kernel : str
+            'contract_h' (default): the libgbci kernel over the signed
+            excitation lists.  'block': H|CI> by group blocks with the PySCF
+            FCI kernels (BlockSigma), slower for large active spaces.
+        pspace_size : int
+            Size of the pspace block of the generalized Davidson solver
+            (completed to whole spin-coupling sets); spaces of at most this
+            many determinants are diagonalized directly.  0 gives the
+            diagonal preconditioner and determinant guesses.
+        guess_noise : float
+            Norm of the random part of the guess vectors (default 1e-3,
+            fixed seed).
+            Without it Davidson can miss roots of irreps absent from the
+            guess.
     '''
+    sigma_kernel = getattr(__config__, 'gbci_GBCISolver_sigma_kernel', 'contract_h')
+    guess_noise = getattr(__config__, 'gbci_GBCISolver_guess_noise', 1e-3)
+    _keys = {'sigma_kernel', 'guess_noise'}
+
     def make_hdiag(self, h1e, eri, ncas, nelecas, conf_info_list, ecore_list, opt=None):
         return make_hdiag(h1e, eri, ncas, nelecas, conf_info_list, ecore_list, opt)
 
@@ -584,11 +956,14 @@ class SpinPenaltyGBCISolver:
                                    ov_list, ecore_list, link_index, ts, **kw)
 
         self.base.contract_h = _proxy_contract_h
+        # the block sigma and the pspace block of kernel() add the penalty
+        self.base._spin_penalty = (self.ss_penalty, self.ss_value)
         try:
             return self.base.kernel(*args, **kwargs)
         finally:
             self.base.contract_h = self._contract_h_base
             del self._contract_h_base
+            del self.base._spin_penalty
     def select_spin_roots(self, civecs, ncas, nelecas, tol=0.20,
                           use_base=True, also_return_s2=False,
                           nroots=None, dbg=False):

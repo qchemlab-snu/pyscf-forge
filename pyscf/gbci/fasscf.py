@@ -24,12 +24,41 @@
 This module keeps selected active orbitals fixed while reoptimizing the
 complementary orbital space with SCF-like iterations. It is based on
 docs/ref_fasscf.py, with a class-centered API and a small helper surface.
+
+EDIIS + DIIS bath solver (ediis_kernel, ediis_kernel_many; the first stage
+of mixed_routine).  With the active orbitals and the spin-summed active
+density A frozen, the bath energy is a closed-shell functional of the core
+projector P = u u^T in the inactive orbital basis:
+
+    E(P) = 2 tr(P h') + tr(P g[P]),   F(P) = h' + g[P],
+    h' = h + (J - K/2)[A],   g[P] = (2J - K)[P]   (linear in P).
+
+Only the spin-summed A enters (the inactive block of the ROHF Fock is
+(F_a + F_b)/2), so this is the functional of kernel() and
+newton_soscf_kernel().  E is exactly quadratic in P, so the EDIIS energy of
+Kudin, Scuseria and Cances (J. Chem. Phys. 116, 8255 (2002), Eq. (8)) is
+exact here also for the interpolated P = sum_i c_i P_i:
+
+    E(sum_i c_i P_i) = sum_i c_i E_i
+                       - 1/2 sum_ij c_i c_j tr((F_i - F_j)(P_i - P_j)).
+
+While max |F P - P F| > ediis_switch, EDIIS minimizes this energy on the
+simplex c_i >= 0, sum c_i = 1 (the global minimum over all faces, their
+Eq. (16)); below it Pulay's commutator DIIS is used, with a history that
+starts at the switch.  DIIS goes back to EDIIS when the error rises above
+ediis_switch and above 10 times its smallest DIIS value.  After
+convergence a negative lowest orbital-Hessian eigenvalue (Davidson) marks a
+saddle point: a step along its eigenvector and a new EDIIS stage follow
+(max_stability).  All baths of one GBCI run are solved in lockstep with one
+batched get_jk call per step.
 """
 
+import itertools
 from contextlib import contextmanager
 from types import MethodType
 
 import numpy as np
+import scipy.linalg
 
 from pyscf import __config__, lib
 from pyscf.fci import cistring
@@ -101,12 +130,523 @@ class FASSCFResult:
             "group_average",
             "group_average_soscf",
             "group_average_newton_soscf",
+            "group_average_ediis",
         ):
             return self.converged, self.e_tot, self.mo_energy, self.mo_coeff
         return self.converged, self.e_tot, self.mo_energy, self.mo_coeff, self.mo_occ
 
+
+def _group_average_occ(ncas, nelecas, group_info_list, target_group):
+    """Alpha and beta active occupations averaged over the determinants of
+    target_group (equal weights, as GroupAverageFASSCF.kernel)."""
+    occs = []
+    for n in (int(nelecas[0]), int(nelecas[1])):
+        strs = np.asarray(cistring.make_strings(range(ncas), n))
+        occs.append(((strs[:, None] >> np.arange(ncas)) & 1).astype(float))
+    nb = occs[1].shape[0]
+    flat = np.asarray(group_info_list).reshape(-1)
+    if flat.size != occs[0].shape[0] * nb:
+        raise ValueError(
+            "group_info_list size does not match the alpha/beta determinant space."
+        )
+    conf = np.nonzero(flat == target_group)[0]
+    if conf.size == 0:
+        raise ValueError(f"No active-space configurations found for {target_group!r}.")
+    return occs[0][conf // nb].mean(axis=0), occs[1][conf % nb].mean(axis=0)
+
+
+def _complement(u):
+    """Orthonormal complement of the orthonormal columns u."""
+    nin, nocc = u.shape
+    _, v = np.linalg.eigh(np.eye(nin) - lib.dot(u, u.T))
+    return v[:, nocc:]
+
+
+class _State:
+    """Core orbitals u, virtual orbitals uv, energy e and Fock matrix f of one
+    bath point (inactive orbital basis)."""
+
+    def __init__(self, u, e, f, uv=None):
+        self.u = u
+        self.uv = _complement(u) if uv is None else uv
+        self.e = e
+        self.f = f
+        fu = lib.dot(f, u)
+        self.foo = lib.dot(u.T, fu)
+        self.fvo = lib.dot(self.uv.T, fu)
+        self.fvv = lib.dot(self.uv.T, lib.dot(f, self.uv))
+        # 2 ||F_vo||, the norm of the inactive ROHF orbital gradient
+        self.norm_g = 2 * np.linalg.norm(self.fvo)
+
+
+class _EDIIS:
+    """EDIIS + DIIS history of one bath.
+
+    Entries: projector P_i, Fock matrix F_i, energy E_i and commutator error
+    e_i = F_i P_i - P_i F_i.  update() adds a point and returns the Fock
+    matrix to diagonalize.  The traces T_ij = tr(F_i P_j) and the overlaps
+    <e_i, e_j> are extended by one row and column per entry."""
+
+    max_ediis = 10       # EDIIS uses at most this many newest entries
+    back_factor = 10.
+    _faces = {}          # n -> index arrays of the faces of the simplex
+
+    def __init__(self, space, switch):
+        self.space = space
+        self.switch = switch
+        self.p, self.f, self.e, self.err = [], [], [], []
+        self._t = np.zeros((0, 0))
+        self._o = np.zeros((0, 0))
+        self.mode = None
+        self.err_min = None
+        self._bar = None     # (P, F, E) of the last EDIIS interpolation
+
+    def _keep(self, idx):
+        idx = list(idx)
+        for name in ("p", "f", "e", "err"):
+            lst = getattr(self, name)
+            setattr(self, name, [lst[i] for i in idx])
+        self._t = self._t[np.ix_(idx, idx)]
+        self._o = self._o[np.ix_(idx, idx)]
+
+    def _push(self, p, f, e):
+        if len(self.p) == self.space:
+            self._keep(range(1, len(self.p)))
+        err = lib.dot(f, p)
+        err = err - err.T
+        n = len(self.p)
+        t = np.empty((n + 1, n + 1))
+        o = np.empty((n + 1, n + 1))
+        t[:n, :n] = self._t
+        o[:n, :n] = self._o
+        for k in range(n):
+            t[n, k] = np.vdot(f, self.p[k])
+            t[k, n] = np.vdot(self.f[k], p)
+            o[n, k] = o[k, n] = np.vdot(err, self.err[k])
+        t[n, n] = np.vdot(f, p)
+        o[n, n] = np.vdot(err, err)
+        self._t, self._o = t, o
+        self.p.append(p)
+        self.f.append(f)
+        self.e.append(e)
+        self.err.append(err)
+
+    def bmat(self, idx):
+        """B_ij = tr((F_i - F_j)(P_i - P_j)) of the entries idx."""
+        t = self._t[np.ix_(idx, idx)]
+        d = np.diag(t)
+        return d[:, None] + d[None, :] - t - t.T
+
+    def model(self, c, idx):
+        """EDIIS energy sum_i c_i E_i - 1/2 c^T B c."""
+        c = np.asarray(c, float)
+        return float(c @ np.asarray(self.e)[idx] - .5 * c @ self.bmat(idx) @ c)
+
+    @classmethod
+    def _face_sets(cls, n):
+        if n not in cls._faces:
+            cls._faces[n] = [np.array(list(itertools.combinations(range(n), m)),
+                                      dtype=int) for m in range(1, n + 1)]
+        return cls._faces[n]
+
+    @classmethod
+    def solve_simplex(cls, e, b):
+        """Global minimum of e.c - 1/2 c^T b c on c >= 0, sum c = 1, from the
+        stationary points of all faces (the faces of one size together)."""
+        e = np.asarray(e, float)
+        n = e.size
+        e = e - e.min()
+        best_f, best_c = np.inf, None
+        for s in cls._face_sets(n):
+            nf, m = s.shape
+            a = np.zeros((nf, m + 1, m + 1))
+            a[:, :m, :m] = -b[s[:, :, None], s[:, None, :]]
+            a[:, :m, m] = a[:, m, :m] = 1.
+            rhs = np.concatenate((-e[s], np.ones((nf, 1))), axis=1)
+            try:
+                x = np.linalg.solve(a, rhs[..., None])[..., 0]
+            except np.linalg.LinAlgError:
+                x = np.full(rhs.shape, np.nan)
+                for r in range(nf):
+                    try:
+                        x[r] = np.linalg.solve(a[r], rhs[r])
+                    except np.linalg.LinAlgError:
+                        pass
+            cs = x[:, :m]
+            ok = np.all(np.isfinite(cs), axis=1) & (cs.min(axis=1) >= -1e-12)
+            if not ok.any():
+                continue
+            cs = np.maximum(cs[ok], 0.)
+            cs /= cs.sum(axis=1, keepdims=True)
+            c = np.zeros((cs.shape[0], n))
+            c[np.arange(cs.shape[0])[:, None], s[ok]] = cs
+            f = c @ e - .5 * np.einsum("ki,ij,kj->k", c, b, c)
+            k = int(np.argmin(f))
+            if f[k] < best_f:
+                best_f, best_c = f[k], c[k]
+        return best_c
+
+    def _ediis(self):
+        n = len(self.p)
+        idx = list(range(max(0, n - self.max_ediis), n))
+        c = self.solve_simplex(np.asarray(self.e)[idx], self.bmat(idx))
+        if c[-1] < 1e-10 and self._bar is not None:
+            # no weight on the new point (history truncated): put the last
+            # interpolated point back, the new point lowers the energy from it
+            self._push(*self._bar)
+            n = len(self.p)
+            self._keep(list(range(n - 2)) + [n - 1, n - 2])
+            idx = list(range(max(0, n - self.max_ediis), n))
+            c = self.solve_simplex(np.asarray(self.e)[idx], self.bmat(idx))
+        p = sum(ci * self.p[i] for ci, i in zip(c, idx))
+        f = sum(ci * self.f[i] for ci, i in zip(c, idx))
+        self._bar = (p, f, self.model(c, idx))
+        return f
+
+    def _cdiis(self):
+        n = len(self.err)
+        h = np.zeros((n + 1, n + 1))
+        h[1:, 1:] = self._o
+        h[0, 1:] = h[1:, 0] = 1.
+        g = np.zeros(n + 1)
+        g[0] = 1.
+        w, v = scipy.linalg.eigh(h)
+        keep = abs(w) > 1e-14
+        c = (v[:, keep] @ ((v[:, keep].T @ g) / w[keep]))[1:]
+        return sum(ci * fi for ci, fi in zip(c, self.f))
+
+    def update(self, st, p):
+        self._push(p, st.f, st.e)
+        err = abs(self.err[-1]).max()
+        if self.mode == "cdiis":
+            self.err_min = min(self.err_min, err)
+            use_ediis = err > max(self.switch, self.back_factor * self.err_min)
+        else:
+            use_ediis = err > self.switch
+            self.err_min = err
+        if use_ediis:
+            self.mode = "ediis"
+            return self._ediis()
+        if self.mode == "ediis":
+            # EDIIS points are interpolations: DIIS starts from the newest
+            self._keep([len(self.p) - 1])
+        self.mode = "cdiis"
+        self._bar = None
+        return self._cdiis()
+
+
+class _Bath:
+    def __init__(self, hprime, label):
+        self.hprime = hprime
+        self.label = label
+        self.st = None
+        self.conv = False
+        self.cycles = 0
+        self.stage = "ediis"
+        self.hess_min = None
+        self.u_imom = None
+
+
+class _BathEDIIS:
+    """Lockstep EDIIS + DIIS and stability following of baths that share
+    the reference orbitals.
+
+    orth : inactive reference orbitals (nao, nin), the basis of u
+    hprimes : h + (J - K/2)[A] of every bath (AO)
+    u0 : start core orbitals (nin, ncore)
+    Rotations x (virtual x core), C <- C expm(K) with K[v,o] = x.  Gradient
+    4 F_vo; Hessian 4 [F_vv x - x F_oo + C_v^T (2J - K)[C_v x C_o^T + h.c.] C_o].
+    """
+
+    def __init__(self, mf, orth, ncore, hprimes, labels, log, conv_tol,
+                 conv_tol_grad, max_cycle, switch, space, occupation,
+                 max_stability, stability_tol, accept_grad=None):
+        if occupation not in ("aufbau", "mom", "imom"):
+            raise ValueError(
+                "ediis_occupation must be 'aufbau', 'mom' or 'imom', not %r"
+                % occupation)
+        self.mf = mf
+        self.orth = orth
+        self.ncore = ncore
+        self.baths = [_Bath(h, lab) for h, lab in zip(hprimes, labels)]
+        self.log = log
+        self.conv_tol = conv_tol
+        self.conv_tol_grad = conv_tol_grad
+        # gradient below which a bath that stops at max_cycle is converged
+        self.accept_grad = conv_tol_grad if accept_grad is None else accept_grad
+        self.max_cycle = max_cycle
+        self.switch = switch
+        self.space = space
+        self.occupation = occupation
+        self.max_stability = max_stability
+        self.stability_tol = stability_tol
+
+    def veff(self, dms):
+        """(J - K/2)[dm] for a stack of symmetric densities."""
+        vj, vk = self.mf.get_jk(self.mf.mol, dms, hermi=1)
+        return np.asarray(vj - .5 * vk).reshape(np.shape(dms))
+
+    def states(self, ks, us, uvs=None):
+        if not ks:
+            return []
+        dms = np.asarray([2 * lib.dot(c, c.T) for c in
+                          (lib.dot(self.orth, u) for u in us)])
+        if self.ncore:
+            vcs = self.veff(dms)
+        else:
+            vcs = np.zeros_like(dms)
+        out = []
+        for i, (k, u, dm, vc) in enumerate(zip(ks, us, dms, vcs)):
+            hp = self.baths[k].hprime
+            e = float(np.einsum("pq,qp", dm, hp + .5 * vc))
+            f = lib.dot(self.orth.T, lib.dot(hp + vc, self.orth))
+            out.append(_State(u, e, f, None if uvs is None else uvs[i]))
+        return out
+
+    @staticmethod
+    def rotate(st, x):
+        nin, ncore = st.u.shape
+        k = np.zeros((nin, nin))
+        k[ncore:, :ncore] = x.reshape(st.fvo.shape)
+        k[:ncore, ncore:] = -k[ncore:, :ncore].T
+        c = lib.dot(np.hstack((st.u, st.uv)), scipy.linalg.expm(k))
+        return c[:, :ncore], c[:, ncore:]
+
+    def diis_many(self, idx, switch):
+        """Lockstep EDIIS + DIIS of the baths idx from bath.st.  A bath that
+        does not converge keeps its iterate of smallest gradient.  Returns
+        the converged flags and the cycles (dicts over idx)."""
+        baths, log = self.baths, self.log
+        dii = {k: _EDIIS(self.space, switch) for k in idx}
+        best = {k: baths[k].st for k in idx}
+        e_last = {k: None for k in idx}
+        conv = {k: False for k in idx}
+        cyc = {k: 0 for k in idx}
+        active = list(idx)
+        for cycle in range(1, self.max_cycle + 1):
+            prop, prop_v, nxt = [], [], []
+            for k in active:
+                b = baths[k]
+                st = b.st
+                cyc[k] = cycle
+                if st.norm_g < best[k].norm_g:
+                    best[k] = st
+                de = np.inf if e_last[k] is None else st.e - e_last[k]
+                if abs(de) < self.conv_tol and st.norm_g < self.conv_tol_grad:
+                    log.debug1("bath %s EDIIS cycle= %d E_core= %.15g "
+                               "delta_E= %4.3g |g_bath|= %4.3g converged",
+                               b.label, cycle, st.e, de, st.norm_g)
+                    conv[k] = True
+                    continue
+                p = lib.dot(st.u, st.u.T)
+                f = dii[k].update(st, p)
+                log.debug1("bath %s EDIIS cycle= %d E_core= %.15g "
+                           "delta_E= %4.3g |g_bath|= %4.3g next: %s",
+                           b.label, cycle, st.e, de, st.norm_g, dii[k].mode)
+                w, y = scipy.linalg.eigh(f)
+                if self.occupation == "aufbau":
+                    occ = np.arange(self.ncore)
+                else:
+                    ref = (b.u_imom if self.occupation == "imom"
+                           and b.u_imom is not None else st.u)
+                    proj = np.einsum("ij,ij->j", y, lib.dot(ref, lib.dot(ref.T, y)))
+                    occ = np.sort(np.argsort(-proj, kind="stable")[:self.ncore])
+                vir = np.setdiff1d(np.arange(y.shape[1]), occ)
+                e_last[k] = st.e
+                prop.append(y[:, occ])
+                prop_v.append(y[:, vir])
+                nxt.append(k)
+            active = nxt
+            if not active:
+                break
+            for k, st in zip(active, self.states(active, prop, prop_v)):
+                baths[k].st = st
+        for k in idx:
+            if not conv[k] and best[k].norm_g < baths[k].st.norm_g:
+                baths[k].st = best[k]
+            if not conv[k] and baths[k].st.norm_g < self.accept_grad:
+                conv[k] = True
+        return conv, cyc
+
+    def hx_many(self, ks, xs):
+        """Orbital Hessian times x for several baths, one batched J/K."""
+        d1s = []
+        cos = []
+        for k, x in zip(ks, xs):
+            st = self.baths[k].st
+            co = lib.dot(self.orth, st.u)
+            a = lib.dot(self.orth, lib.dot(st.uv, x.reshape(st.fvo.shape)))
+            d1 = lib.dot(a, co.T)
+            d1s.append(d1 + d1.T)
+            cos.append(co)
+        v1s = self.veff(np.asarray(d1s))
+        out = []
+        for k, x, v1, co in zip(ks, xs, v1s, cos):
+            st = self.baths[k].st
+            x = x.reshape(st.fvo.shape)
+            cv = lib.dot(self.orth, st.uv)
+            hx = (lib.dot(st.fvv, x) - lib.dot(x, st.foo)
+                  + 2 * lib.dot(cv.T, lib.dot(v1, co)))
+            out.append((4 * hx).ravel())
+        return out
+
+    def lowest_many(self, ks, x0, tol=1e-3, nstart=3, max_cycle=60):
+        """Lowest orbital-Hessian eigenvalue of the baths ks (lockstep
+        Davidson).  x0: {k: previous eigenvector as a generator in the
+        inactive basis}; else the unit vectors of the nstart lowest diagonal
+        elements.  Returns ({k: eigenvalue}, {k: eigenvector})."""
+        baths = self.baths
+        hd, vs, avs, lam, vec = {}, {}, {}, {}, {}
+        k0s, x0s = [], []
+        for k in ks:
+            st = baths[k].st
+            hd[k] = 4 * (np.diag(st.fvv)[:, None] - np.diag(st.foo)[None, :]).ravel()
+            xs = []
+            if k in x0:
+                x = lib.dot(st.uv.T, lib.dot(x0[k], st.u)).ravel()
+                nx = np.linalg.norm(x)
+                if nx > 1e-3:
+                    xs = [x / nx]
+            if not xs:
+                for i in np.argsort(hd[k])[:nstart]:
+                    x = np.zeros_like(hd[k])
+                    x[i] = 1.
+                    xs.append(x)
+            vs[k], avs[k] = xs, []
+            k0s += [k] * len(xs)
+            x0s += xs
+        for k, ax in zip(k0s, self.hx_many(k0s, x0s)):
+            avs[k].append(ax)
+        active = list(ks)
+        for _ in range(max_cycle):
+            new_k, new_t = [], []
+            for k in active:
+                v = np.array(vs[k])
+                av = np.array(avs[k])
+                h = lib.dot(v, av.T)
+                w, y = np.linalg.eigh(.5 * (h + h.T))
+                x = y[:, 0] @ v
+                r = y[:, 0] @ av - w[0] * x
+                lam[k], vec[k] = float(w[0]), x
+                if np.linalg.norm(r) < tol:
+                    continue
+                d = hd[k] - w[0]
+                d[abs(d) < 1e-4] = 1e-4
+                t = r / d
+                for _ in range(2):
+                    t -= v.T @ (v @ t)
+                nt = np.linalg.norm(t)
+                if nt < 1e-8 or len(vs[k]) >= 40:
+                    continue
+                new_k.append(k)
+                new_t.append(t / nt)
+            if not new_k:
+                break
+            for k, t, at in zip(new_k, new_t, self.hx_many(new_k, new_t)):
+                vs[k].append(t)
+                avs[k].append(at)
+            active = new_k
+        return lam, vec
+
+    def follow(self, idx):
+        """Stability following of the converged baths idx: a lowest Hessian
+        eigenvalue below -stability_tol gives a step along its eigenvector
+        (best of 8 trial points) and a new EDIIS stage (switch 1e-3)."""
+        baths, log = self.baths, self.log
+        check = [k for k in idx if baths[k].conv and baths[k].st.fvo.size]
+        x0 = {}
+        for _ in range(self.max_stability):
+            if not check:
+                break
+            lam, vec = self.lowest_many(check, x0)
+            saddle = []
+            for k in check:
+                baths[k].hess_min = lam[k]
+                if lam[k] < -self.stability_tol:
+                    saddle.append(k)
+            if not saddle:
+                break
+            trial_k, trial_u, trial_v = [], [], []
+            for k in saddle:
+                for a in (.1, .2, .4, .8):
+                    for sgn in (1, -1):
+                        u, uv = self.rotate(baths[k].st, sgn * a * vec[k])
+                        trial_k.append(k)
+                        trial_u.append(u)
+                        trial_v.append(uv)
+            trials = self.states(trial_k, trial_u, trial_v)
+            moved = []
+            for k in saddle:
+                b = baths[k]
+                best = min((t for kk, t in zip(trial_k, trials) if kk == k),
+                           key=lambda t: t.e)
+                log.note("bath %s: saddle point (lowest Hessian eigenvalue "
+                         "%.3g, E_core = %.10f); stability step to %.10f",
+                         b.label, lam[k], b.st.e, best.e)
+                if best.e < b.st.e:
+                    st = b.st
+                    x0[k] = lib.dot(st.uv, lib.dot(vec[k].reshape(st.fvo.shape),
+                                                   st.u.T))
+                    b.st = best
+                    b.u_imom = best.u
+                    moved.append(k)
+            if not moved:
+                break
+            conv, cyc = self.diis_many(moved, 1e-3)
+            for k in moved:
+                b = baths[k]
+                b.cycles += cyc[k]
+                b.stage += "+stability"
+                b.conv = conv[k]
+            check = [k for k in moved if baths[k].conv]
+
+    def run(self, u0):
+        n = len(self.baths)
+        for b, st in zip(self.baths, self.states(list(range(n)), [u0] * n)):
+            b.st = st
+            b.u_imom = u0
+        if self.ncore == 0:
+            for b in self.baths:
+                b.conv, b.stage = True, "trivial"
+            return self.baths
+        idx = list(range(n))
+        conv, cyc = self.diis_many(idx, self.switch)
+        for k in idx:
+            self.baths[k].conv, self.baths[k].cycles = conv[k], cyc[k]
+        if self.max_stability:
+            self.follow(idx)
+        return self.baths
+
 class FASSCF(rohf.ROHF):
-    """ROHF-derived optimizer with frozen active orbitals."""
+    """ROHF-derived optimizer with frozen active orbitals.
+
+    Attributes of the EDIIS + DIIS solver (ediis_kernel):
+        ediis_switch : float
+            EDIIS -> DIIS switch on max |F P - P F| (default 0.1).
+        ediis_occupation : str
+            Core orbitals of each step: 'aufbau' (default, lowest orbital
+            energies, as kernel()), 'mom' (maximum overlap with the previous
+            core) or 'imom' (maximum overlap with the start core).
+        max_stability : int
+            Steps of the stability following (default 5, 0 = off).
+        stability_tol : float
+            A lowest orbital-Hessian eigenvalue below -stability_tol marks a
+            saddle point (default 1e-4).
+        diis_space : int
+            History length of EDIIS/DIIS (SCF attribute, default 8).
+        conv_tol_grad : float
+            With the default None the EDIIS solver converges the bath
+            gradient to 1e-3 sqrt(conv_tol), not below 1e-8 (DIIS converges
+            fast near the solution); a bath that reaches max_cycle
+            with a gradient below sqrt(conv_tol) (the threshold of kernel())
+            counts as converged.
+    """
+
+    ediis_switch = getattr(__config__, "gbci_FASSCF_ediis_switch", 0.1)
+    ediis_occupation = getattr(__config__, "gbci_FASSCF_ediis_occupation", "aufbau")
+    max_stability = getattr(__config__, "gbci_FASSCF_max_stability", 5)
+    stability_tol = getattr(__config__, "gbci_FASSCF_stability_tol", 1e-4)
+    _keys = {"ediis_switch", "ediis_occupation", "max_stability", "stability_tol"}
 
     def __init__(
         self,
@@ -784,6 +1324,118 @@ class FASSCF(rohf.ROHF):
 
     newton_soscf = newton_soscf_kernel
 
+    def _ediis_baths(self, mo_coeff, active_idx, core_idx, active_dms,
+                     max_cycle, conv_tol, conv_tol_grad, labels=None):
+        """EDIIS + DIIS (lockstep) of the baths of the spin-summed active
+        densities active_dms (AO), all with the reference orbitals mo_coeff.
+        Returns per bath (converged, mo_coeff, cycles); the inactive columns
+        hold the canonical core and virtual orbitals."""
+        log = logger.new_logger(self)
+        mol = self.mol
+        if conv_tol_grad is None:
+            # DIIS converges fast near the solution: a tighter gradient
+            # than kernel() at little cost (quantities that are linear in
+            # the bath orbitals, e.g. XMS energies and nuclear gradients,
+            # then do not depend on the solver path); a bath that stops at
+            # max_cycle below sqrt(conv_tol) is converged
+            accept_grad = np.sqrt(conv_tol)
+            conv_tol_grad = min(max(1e-3 * accept_grad, 1e-8), accept_grad)
+        else:
+            accept_grad = conv_tol_grad
+        nmo = mo_coeff.shape[1]
+        inact = np.setdiff1d(np.arange(nmo), active_idx)
+        vir_idx = np.setdiff1d(inact, core_idx)
+        orth = np.asarray(mo_coeff[:, inact], order="C")
+        ncore = len(core_idx)
+        u0 = np.eye(inact.size)[:, np.searchsorted(inact, core_idx)]
+        if labels is None:
+            labels = [str(k) for k in range(len(active_dms))]
+        vj, vk = self.get_jk(mol, np.asarray(active_dms), hermi=1)
+        hcore = self.get_hcore(mol)
+        hprimes = [hcore + v for v in
+                   np.asarray(vj - .5 * vk).reshape(np.shape(active_dms))]
+        solver = _BathEDIIS(
+            self, orth, ncore, hprimes, labels, log, conv_tol, conv_tol_grad,
+            max_cycle, self.ediis_switch, self.diis_space,
+            self.ediis_occupation, self.max_stability, self.stability_tol,
+            accept_grad)
+        out = []
+        for b in solver.run(u0):
+            st = b.st
+            yo = scipy.linalg.eigh(st.foo)[1] if st.foo.size else st.foo
+            yv = scipy.linalg.eigh(st.fvv)[1] if st.fvv.size else st.fvv
+            mo = np.array(mo_coeff, copy=True)
+            mo[:, core_idx] = lib.dot(orth, lib.dot(st.u, yo))
+            mo[:, vir_idx] = lib.dot(orth, lib.dot(st.uv, yv))
+            log.info("bath %s: EDIIS converged=%s (%s, %d cycles) "
+                     "E_core= %.15g  |g_bath|= %4.3g  lowest Hessian "
+                     "eigenvalue %s", b.label, b.conv, b.stage, b.cycles,
+                     st.e, st.norm_g,
+                     "-" if b.hess_min is None else "%.3g" % b.hess_min)
+            out.append((bool(b.conv), mo, b.cycles))
+        return out
+
+    def _ediis_result(self, converged, mo_coeff, mo_occ, dm, cycles, mode):
+        """FASSCFResult with the energy and the orbital energies of the
+        Roothaan Fock matrix at mo_coeff (as the convergence check of
+        kernel())."""
+        mol = self.mol
+        h1e = self.get_hcore(mol)
+        s1e = self.get_ovlp(mol)
+        vhf = self.get_veff(mol, dm)
+        fock = np.asarray(self.get_fock(h1e, s1e, vhf, dm))
+        mo_energy = np.diag(mo_coeff.conj().T @ fock @ mo_coeff)
+        if np.allclose(mo_energy.imag, 0):
+            mo_energy = mo_energy.real
+        e_tot = self.energy_tot(dm, h1e, vhf)
+        return FASSCFResult(converged, float(e_tot), mo_energy, mo_coeff,
+                            mo_occ, dm, cycles, mode=mode)
+
+    def ediis_kernel_many(
+        self,
+        targets,
+        mo_coeff=None,
+        max_cycle=None,
+        conv_tol=None,
+        conv_tol_grad=None,
+    ):
+        """EDIIS + DIIS of the baths of several active occupations (each
+        target as in kernel()) from the same reference orbitals, in
+        lockstep.  Returns a list of FASSCFResult (mode "ediis").  A bath
+        that does not converge returns the reference orbitals if
+        restore_on_failure."""
+        conv_tol = self.conv_tol if conv_tol is None else conv_tol
+        conv_tol_grad = self.conv_tol_grad if conv_tol_grad is None else conv_tol_grad
+        max_cycle = self.max_cycle if max_cycle is None else max_cycle
+        preps = [self.prepare_orbitals(mo_coeff, None, None, None, None, t)
+                 for t in targets]
+        mo_ref, _, active_idx, core_idx, _, _ = preps[0]
+        cact = mo_ref[:, active_idx]
+        adms = [lib.dot(cact * p[4], cact.conj().T) for p in preps]
+        sols = self._ediis_baths(mo_ref, active_idx, core_idx, adms,
+                                 max_cycle, conv_tol, conv_tol_grad)
+        results = []
+        for (conv, mo, cycles), p in zip(sols, preps):
+            if not conv and self.restore_on_failure:
+                mo = np.array(mo_ref, copy=True)
+            mo_occ = p[5]
+            dm = self.make_rdm1(mo, mo_occ)
+            results.append(self._ediis_result(conv, mo, mo_occ, dm, cycles,
+                                              "ediis"))
+        return results
+
+    def ediis_kernel(
+        self,
+        target=None,
+        mo_coeff=None,
+        max_cycle=None,
+        conv_tol=None,
+        conv_tol_grad=None,
+    ):
+        """Run active-frozen FASSCF with the EDIIS + DIIS solver."""
+        return self.finish(self.ediis_kernel_many(
+            [target], mo_coeff, max_cycle, conv_tol, conv_tol_grad)[0])
+
     def mixed_routine(
         self,
         target=None,
@@ -793,7 +1445,16 @@ class FASSCF(rohf.ROHF):
         max_cycle1=50,
         max_cycle2=100,
         dump_chk=None,
+        ediis=True,
     ):
+        """EDIIS + DIIS (ediis=True); if it fails, the damped and
+        level-shifted kernel() and then Newton SOSCF (soscf=True)."""
+        if ediis:
+            result = self.ediis_kernel(target=target, max_cycle=max_cycle1)
+            if result.converged:
+                return result
+            logger.info(self, "FASSCF: EDIIS + DIIS not converged; "
+                        "damped iterations follow")
         options = {"damp": damp, "level_shift": level_shift}
         result = self.kernel(
             target=target,
@@ -1236,6 +1897,80 @@ class GroupAverageFASSCF(FASSCF):
 
     group_average = kernel
 
+    def ediis_kernel_many(
+        self,
+        target_groups,
+        group_info_list,
+        mo_coeff=None,
+        ncas=None,
+        nelecas=None,
+        ncore=None,
+        max_cycle=None,
+        conv_tol=None,
+        conv_tol_grad=None,
+    ):
+        """EDIIS + DIIS of the group-average baths of several groups in
+        lockstep.  Returns a list of FASSCFResult (mode
+        "group_average_ediis").  A bath that does not converge returns the
+        reference orbitals if restore_on_failure."""
+        conv_tol = self.conv_tol if conv_tol is None else conv_tol
+        conv_tol_grad = self.conv_tol_grad if conv_tol_grad is None else conv_tol_grad
+        max_cycle = self.max_cycle if max_cycle is None else max_cycle
+        gbci = self.gbci
+        if mo_coeff is None and gbci is not None:
+            mo_coeff = getattr(gbci, "mo_coeff", None)
+        if mo_coeff is None:
+            mo_coeff = self.mo_coeff
+        mo_coeff = np.asarray(mo_coeff)
+        if gbci is not None:
+            ncas = getattr(gbci, "ncas", None) if ncas is None else ncas
+            nelecas = getattr(gbci, "nelecas", None) if nelecas is None else nelecas
+            ncore = getattr(gbci, "ncore", None) if ncore is None else ncore
+        ncas = int(self.ncas if ncas is None else ncas)
+        nelecas = self.nelecas if nelecas is None else nelecas
+        ncore = int(self.ncore if ncore is None else ncore)
+        nmo = mo_coeff.shape[1]
+        active_idx = np.arange(ncore, ncore + ncas, dtype=int)
+        self.validate_indices(active_idx, nmo, "active_orbitals")
+        cact = mo_coeff[:, active_idx]
+        occs = [_group_average_occ(ncas, nelecas, group_info_list, g)
+                for g in target_groups]
+        as_dms = [((cact * oa).dot(cact.conj().T), (cact * ob).dot(cact.conj().T))
+                  for oa, ob in occs]
+        sols = self._ediis_baths(
+            mo_coeff, active_idx, np.arange(ncore), [a + b for a, b in as_dms],
+            max_cycle, conv_tol, conv_tol_grad,
+            labels=[str(g) for g in target_groups])
+        results = []
+        for (conv, mo, cycles), (oa, ob), (dma, dmb) in zip(sols, occs, as_dms):
+            if not conv and self.restore_on_failure:
+                mo = np.array(mo_coeff, copy=True)
+            mo_occ = np.zeros(nmo)
+            mo_occ[:ncore] = 2.0
+            mo_occ[active_idx] = oa + ob
+            core = mo[:, :ncore].dot(mo[:, :ncore].conj().T)
+            dm = np.asarray((core + dma, core + dmb))
+            results.append(self._ediis_result(conv, mo, mo_occ, dm, cycles,
+                                              "group_average_ediis"))
+        return results
+
+    def ediis_kernel(
+        self,
+        target_group,
+        group_info_list,
+        mo_coeff=None,
+        ncas=None,
+        nelecas=None,
+        ncore=None,
+        max_cycle=None,
+        conv_tol=None,
+        conv_tol_grad=None,
+    ):
+        """Run group-average FASSCF with the EDIIS + DIIS solver."""
+        return self.finish(self.ediis_kernel_many(
+            [target_group], group_info_list, mo_coeff, ncas, nelecas, ncore,
+            max_cycle, conv_tol, conv_tol_grad)[0])
+
     def mixed_routine(
         self,
         target_group,
@@ -1246,7 +1981,17 @@ class GroupAverageFASSCF(FASSCF):
         max_cycle1=100,
         max_cycle2=300,
         dump_chk=None,
+        ediis=True,
     ):
+        """EDIIS + DIIS (ediis=True); if it fails, the damped and
+        level-shifted kernel() and then Newton SOSCF (soscf=True)."""
+        if ediis:
+            result = self.ediis_kernel(target_group, group_info_list,
+                                       max_cycle=max_cycle1)
+            if result.converged:
+                return result
+            logger.info(self, "FASSCF: EDIIS + DIIS not converged; "
+                        "damped iterations follow")
         options = {"damp": damp, "level_shift": level_shift}
         result = self.kernel(
             target_group=target_group,

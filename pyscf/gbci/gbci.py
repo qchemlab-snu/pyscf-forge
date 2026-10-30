@@ -32,6 +32,7 @@ References:
     Phys. Chem. Chem. Phys. 2014, 16, 22694
 '''
 
+import inspect
 import numpy
 import numpy as np
 from itertools import product
@@ -520,6 +521,10 @@ def group_by_atom(mol, ac_mo_coeff, po_list, atom_groups, thres=0.2):
         groups.append(g)
     return groups
 
+def _mixed_default(fasscf, name):
+    '''Default value of the mixed_routine argument name of fasscf.'''
+    return inspect.signature(fasscf.mixed_routine).parameters[name].default
+
 def optimize_mo(gbci, mo_coeff=None, ncas=None, nelecas=None, ncore=None,
                 group_a=None):
     if mo_coeff is None : mo_coeff = gbci.mo_coeff
@@ -539,11 +544,23 @@ def optimize_mo(gbci, mo_coeff=None, ncas=None, nelecas=None, ncore=None,
         optimized_mo_energy = numpy.zeros((len(po_list), N))
         fasscf = gbci._get_fasscf(
             group_spec, mo_coeff, ncas, nelecas, ncore)
-        for i, occ in enumerate(po_list):
+        # EDIIS + DIIS of all baths in lockstep; the baths it does not
+        # converge go through mixed_routine without EDIIS
+        options = gbci._mixed_routine_options(fasscf)
+        ediis_results = [None] * len(po_list)
+        if options.get('ediis', True):
             fasscf.mo_coeff = mo_coeff
             fasscf.mo_energy = gbci.mo_energy
-            result = fasscf.mixed_routine(
-                target=occ, **gbci._mixed_routine_options(fasscf))
+            ediis_results = fasscf.ediis_kernel_many(
+                po_list, max_cycle=options.get(
+                    'max_cycle1', _mixed_default(fasscf, 'max_cycle1')))
+            options['ediis'] = False
+        for i, occ in enumerate(po_list):
+            result = ediis_results[i]
+            if result is None or not result.converged:
+                fasscf.mo_coeff = mo_coeff
+                fasscf.mo_energy = gbci.mo_energy
+                result = fasscf.mixed_routine(target=occ, **options)
             conv, et, moe, moce, moocc = result.as_tuple()
             log.debug("occupation pattern index: %d", i)
             log.debug("FASSCF converged=%s energy=%s", conv, et)
@@ -569,12 +586,22 @@ def optimize_mo(gbci, mo_coeff=None, ncas=None, nelecas=None, ncore=None,
     optimized_mo_energy = numpy.zeros((g,N))
     fasscf = gbci._get_fasscf(
         group_spec, mo_coeff, ncas, nelecas, ncore)
-    for i in range(0,g):
+    options = gbci._mixed_routine_options(fasscf)
+    ediis_results = [None] * g
+    if options.get('ediis', True):
         fasscf.mo_coeff = mo_coeff
         fasscf.mo_energy = gbci.mo_energy
-        result = fasscf.mixed_routine(
-            target_group=i, group_info_list=group_info_flat,
-            **gbci._mixed_routine_options(fasscf))
+        ediis_results = fasscf.ediis_kernel_many(
+            list(range(g)), group_info_flat, max_cycle=options.get(
+                'max_cycle1', _mixed_default(fasscf, 'max_cycle1')))
+        options['ediis'] = False
+    for i in range(0,g):
+        result = ediis_results[i]
+        if result is None or not result.converged:
+            fasscf.mo_coeff = mo_coeff
+            fasscf.mo_energy = gbci.mo_energy
+            result = fasscf.mixed_routine(
+                target_group=i, group_info_list=group_info_flat, **options)
         conv, et, moe, moce = result.as_tuple()
         optimized_mo[i]=moce
         if moe is None:
@@ -1197,14 +1224,17 @@ class GBCI(CASBase):
         p = len(po_list)
         dmet_core_list = numpy.zeros((p,p,N,N))
         ov_list = numpy.zeros((p,p))
+        # D_ji = D_ij^T and ov_ji = ov_ij: one SVD per pair i >= j
         for i in range(0,p):
             xc_mo_coeff = mo_list[i][:,core_list]
-            for j in range(0,p):
+            for j in range(0,i+1):
                 wc_mo_coeff = mo_list[j][:,core_list]
                 S, xc_bimo_coeff, wc_bimo_coeff, U, Vt = biorthogonalize(xc_mo_coeff, wc_mo_coeff, s1e)
                 #ov_list[i,j] = numpy.prod(S[numpy.abs(S)>1e-10])*numpy.linalg.det(U)*numpy.linalg.det(Vt)
-                ov_list[i,j] = numpy.prod(S[numpy.abs(S)>1e-10]**2)
-                dmet_core_list[i,j] += xc_bimo_coeff @ numpy.diag(1/S) @ wc_bimo_coeff.T
+                ov_list[i,j] = ov_list[j,i] = numpy.prod(S[numpy.abs(S)>1e-10]**2)
+                dmet_core_list[i,j] += lib.dot(xc_bimo_coeff / S, wc_bimo_coeff.T)
+                if j < i:
+                    dmet_core_list[j,i] = dmet_core_list[i,j].T
         return dmet_core_list, ov_list
 
     def get_active_dm(self,mo_coeff = None):

@@ -91,8 +91,12 @@ def energy_mcwfn(mc, mo_coeff=None, ci=None, ot=None, dm1s=None,
 
 
 def energy_dft(mc, mo_coeff=None, ci=None, ot=None, dm1s=None,
-               otpd_data=None, ot_root_cache=None):
-    """Compute GBPDFT on-top energy by the one-step pair-density route."""
+               otpd_data=None, ot_root_cache=None, ontop="exact"):
+    """Compute GBPDFT on-top energy by the one-step pair-density route.
+
+    ``ontop="cas_cumulant"`` uses the active-only CAS cumulant of Ref. [1]
+    instead (see `otpd.energy_ot`).
+    """
     if ot is None:
         ot = mc.otfnal
     if mo_coeff is None:
@@ -103,11 +107,11 @@ def energy_dft(mc, mo_coeff=None, ci=None, ot=None, dm1s=None,
         dm1s = mc.make_rdm1s(ci, mo_coeff=mo_coeff)
     if otpd_data is None:
         otpd_data = mc.make_otpd_intermediates(mo_coeff=mo_coeff)
-    if ot_root_cache is None:
+    if ot_root_cache is None and ontop == "exact":
         ot_root_cache = otpd.make_root_intermediates(ci, otpd_data)
     return otpd.energy_ot(
         ot, dm1s, mo_coeff, mc.ncore, mc.ncas, ci=ci, data=otpd_data,
-        ot_root_cache=ot_root_cache, max_memory=mc.max_memory)
+        ot_root_cache=ot_root_cache, max_memory=mc.max_memory, ontop=ontop)
 
 
 class _BPDFT:
